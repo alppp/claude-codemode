@@ -18,7 +18,6 @@ const MAX_STDERR = 4096
 const STORE_KEYS = 256
 const STORE_VALUE = 1_000_000
 const GUEST_PATH = 'PATH=/usr/local/bin:/usr/bin:/bin'
-const DOC_CAP = 1500
 // A soft call (sh, ssh) that ends in "Exit code N" is data. Bash's own
 // timeout or kill still fails.
 const EXIT = /^Exit code (-?\d+)/
@@ -32,41 +31,36 @@ const DESCRIPTIONS = { plugin: 'codemode', key: 'descriptions' } as const
 const RUNS = { plugin: 'codemode', key: 'runs' } as const
 const EXPANDED = { plugin: 'codemode', key: 'expanded' } as const
 
-const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value and console lines come back to you.
+// The host rejects a tool description over 4096 chars, and then the tool
+// does not exist in the session. Keep DESCRIPTION near 2900 chars.
+const MAX_DESCRIPTION = 4000
+const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value, console lines and a call ledger come back.
 
-Use it for 3 or more calls, fan-out over many files or commands, or big outputs you filter in code. For one small call, call the tool directly. For an investigation, put every independent probe in the first exec. sh() and ssh() return a non-zero exit as data, so one empty grep does not stop the batch. Exec waits for every inner call, and your turn blocks until then. Run builds, deploys, big syncs and anything over about a minute with the Bash tool and run_in_background, several at once when they are independent.
+Use it for 3 or more calls, fan-out, or big outputs you filter in code. For an investigation, put every independent probe in the first exec. One small call: use the tool directly. Builds, deploys and jobs over about a minute: Bash with run_in_background.
 
-The program is the body of an async function: use await and return. A string comes back as is, other values as JSON. Long multi-line strings come back as raw sections. TypeScript types are stripped, not checked; enum and namespace fail. The program has no file system, network or process access. All I/O goes through tools, under the normal permissions and hooks.
+The program is the body of an async function: use await and return. Strings come back as is, other values as JSON, long multi-line strings as raw sections. TS types are stripped; enum and namespace fail. No Node APIs: all I/O goes through tools, under the normal permissions.
 
 Globals:
-- tools.Name(input): the tool's text. Throws ToolError on failure or deny.
-- call(name, input): { text, result, isError, deny }. Never throws.
-- read(path, { offset, limit }?): the file content, no line numbers. A file too big for one Read is read in pages, up to about 48k tokens. A cut read ends with a "[codemode: read stopped at line N ...]" line.
-- bash(command, opts?): stdout. A non-zero exit throws ToolError.
-- sh(command, opts?) or sh\`cmd \${x}\`: { ok, code, out }. A non-zero exit is data. A grep or rg with no match gives code 1 and meaning "No matches found". A deny or a Bash timeout throws ToolError. In the template form, each \${x} becomes one single-quoted word, and an array becomes one word per item. opts go to Bash (timeout in ms, description). sh(opts)\`cmd\` also works.
-- ssh(host, script, opts?) or ssh(host)\`cmd \${x}\`: { ok, code, out, host, timedOut }. The script runs in bash on the host. It goes over stdin, so it needs no extra quoting. A command in it that reads stdin eats the rest of the script: give that command </dev/null. opts.timeout is in seconds, default 90. Exit 255 is an ssh failure.
-- q(...words): the words in POSIX single quotes, joined by spaces. Arrays flatten.
-- listTools(filter?): [{ name, summary }]. The filter is a substring or a RegExp.
-- describe(name): the tool's full description.
-- store.get(key), store.set(key, value), store.delete(key), store.keys(): JSON values kept across exec calls in this session (256 keys, 1 MB each). Only exec sees them. Bash does not.
-- helpers(): the doc lines of the prelude files that loaded.
-- projectDir: the nearest dir at or above the launch dir that holds .codemode, else the launch dir.
-- console.log(...): lines after the result.
-- ToolError: an Error with .tool and .text.
+- sh(cmd, opts?) or sh\`cmd \${x}\`: { ok, code, out, saved? }. A non-zero exit is data, so one empty grep does not stop a batch (no match: code 1, meaning "No matches found"). A deny or Bash timeout throws. Template values become single-quoted words; arrays give one word per item. opts go to Bash (timeout ms, description).
+- ssh(host, script, opts?) or ssh(host)\`...\`: { ok, code, out, host, timedOut }. The script goes to remote bash on stdin: no extra quoting. Give stdin readers </dev/null. opts.timeout in s, default 90. Exit 255: ssh failed.
+- bash(cmd, opts?): stdout. A non-zero exit throws ToolError.
+- read(path, { offset, limit }?): content without line numbers. Big files are paged up to about 48k tokens; a cut read ends with a "[codemode: read stopped at line N ...]" line.
+- tools.Name(input): the tool's text; throws ToolError. call(name, input): { text, result, isError, deny }; never throws.
+- q(...words): POSIX single-quoted words.
+- listTools(filter?), describe(name): tool names and full descriptions.
+- store.get/set/delete/keys: JSON kept across execs in this session (256 keys, 1 MB each). Bash cannot see it.
+- helpers(): doc lines of the loaded prelude files. projectDir: launch dir, or the nearest one above it with .codemode.
+- console.log, ToolError (.tool, .text).
 
-Result shapes: Read gives result.file.content. Bash gives result.stdout, with stderr merged in. A failed Bash call has isError true, text "Exit code N" and then the output, and no structured result. Bash keeps the first 30000 chars of output. When it cuts more, sh() and ssh() also give saved, the path of the full output. A non-zero exit keeps 10000 of those chars, the head and the tail. With run_in_background, Bash returns the task id at once. The completion notice comes to you, not to the program.
+Bash output: stdout with stderr merged, cut at 30000 chars (sh and ssh give saved, the full-output path). A failed call keeps 10000 chars. With run_in_background, Bash returns the task id at once.
 
-Prelude: each exec first runs ~/.claude/codemode/prelude/*.{js,ts}, then <projectDir>/.codemode/prelude/*.{js,ts}. Their top-level declarations are globals in the program. A prelude that throws is skipped, and the result says so.
+Prelude: each exec first runs ~/.claude/codemode/prelude/*.{js,ts}, then <projectDir>/.codemode/prelude/*.{js,ts}. Their top-level declarations are globals. A prelude that throws is skipped with a note.
 
-timeoutSeconds (default 120, max 600) counts program time only. Time spent waiting on tools and permission dialogs does not count. Up to 8 calls run at once, and 300 per run. The result ends with a ledger of the calls.
+timeoutSeconds (default 120, max 600) counts program time only, not tool waits. 8 calls run at once, 300 per run.
 
 Example:
-const [hits, disk, head] = await Promise.all([
-  sh\`rg -n -i \${"needle"} src\`,
-  ssh("buildhost", "df -h /; uptime"),
-  sh("git log -1 --format=%s"),
-])
-return { hits: hits.ok ? hits.out : \`no hits (exit \${hits.code})\`, disk: disk.out, head: head.out.trim() }`
+const [hits, disk] = await Promise.all([sh\`rg -n -i \${"needle"} src\`, ssh("buildhost", "df -h /")])
+return { hits: hits.ok ? hits.out : \`exit \${hits.code}\`, disk: disk.out }`
 
 // quiet: a read() page. When it fails on Read's size or token cap, read() pages
 // around it, so it leaves no ledger entry. soft: an sh() or ssh() call.
@@ -266,20 +260,18 @@ const loadPreludes = async ($: Host, fallbackRoot?: string) => {
   return { projectDir, preludes }
 }
 
-// The description's helper block: the "//: " doc lines of the prelude files
-// at session start, cut near DOC_CAP chars.
-const helperDocs = (preludes: Prelude[]) => {
-  const files = preludes
-    .map(p => ({ path: p.path, lines: (p.source ?? '').split('\n').flatMap(l => DOC_LINE.exec(l)?.[1] ?? []) }))
-    .filter(f => f.lines.length)
-  if (!files.length) return ''
-  let text = `Helpers (from ${files.map(f => f.path).join(', ')}). This list is from session start. Later edits to these files reach helpers() and the runtime, not this text.`
-  for (const line of files.flatMap(f => f.lines)) {
-    if (text.length + line.length + 3 > DOC_CAP) {
-      text += '\n- ... helpers() lists the rest.'
-      break
-    }
-    text += `\n- ${line}`
+// The description's helper block: the helper signatures from the "//: " doc
+// lines at session start. helpers() gives the full lines.
+const helperDocs = (preludes: Prelude[], room: number) => {
+  const names = preludes
+    .flatMap(p => (p.source ?? '').split('\n').flatMap(l => DOC_LINE.exec(l)?.[1] ?? []))
+    .map(line => /^[^:]*?\)/.exec(line)?.[0] ?? line.split(':')[0] ?? line)
+  if (!names.length) return ''
+  let text = 'Prelude helpers (helpers() gives their docs; edits after session start reach the runtime only):'
+  for (const [i, name] of names.entries()) {
+    const part = `${i ? ',' : ''} ${name}`
+    if (text.length + part.length + 12 > room) return `${text}, and more`
+    text += part
   }
   return text
 }
@@ -293,10 +285,11 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     const { preludes } = await loadPreludes($, e.cwd).catch(() => ({ preludes: [] }))
-    const docs = helperDocs(preludes)
+    const docs = helperDocs(preludes, MAX_DESCRIPTION - DESCRIPTION.length - 2)
+    const description = docs ? `${DESCRIPTION}\n\n${docs}` : DESCRIPTION
     await $.tool.register({
       name: 'exec',
-      description: docs ? `${DESCRIPTION}\n\n${docs}` : DESCRIPTION,
+      description: description.length <= MAX_DESCRIPTION ? description : DESCRIPTION,
       inputSchema: {
         type: 'object',
         properties: {
