@@ -25,6 +25,28 @@ const BASH_KILLED = /Command timed out after |Command killed: /
 const PRELUDE_FILE = /^(?!.*\.d\.ts$).+\.(js|ts)$/
 const DOC_LINE = /^\/\/: (.*?)\r?$/
 
+// The nudge on serial read-only calls outside exec (see the tool.call hook).
+const PROBE_TOOLS = new Set(['Bash', 'Grep', 'Glob'])
+// Calls that neither count nor end a run of probes. Read often comes
+// before an Edit, so it stays out of the count.
+const NEUTRAL_TOOLS = new Set(['Read', 'ToolSearch', 'TaskOutput', 'TodoWrite'])
+const NUDGE_MAX = 3
+const MAIN_LOOP = 'main'
+const NUDGE =
+  'codemode: this is the second read-only call in a row outside exec. Put the next independent probes in one mcp__codemode__exec.'
+// probes counts the direct read-only calls since the last reset.
+type Loop = { probes: number; isNudged: boolean; nudges: number }
+// Core's read-only check does not cover ssh and a few other readers, so a Bash
+// call also counts when its first word reads and nothing in it writes. The
+// same lists as scripts/usage.py.
+const LEAD = /^\s*(?:cd\s+\S+\s*(?:&&|;)\s*|[A-Z_][A-Z0-9_]*=\S*\s+|timeout\s+(?:-\S+\s+\S+\s+)?\S+\s+)*/
+const READ_HEAD =
+  /^(?:rg|grep|ug|sed|awk|cat|head|tail|ls|fd|find|plocate|wc|jq|stat|file|du|df|md5sum|diff|ssh|curl|unzip|javap|docker|journalctl|git\s+(?:log|show|status|diff|blame|grep|ls-files))\b/
+const WRITES =
+  /(^|[^>&0-9])>(?!&|\/dev\/null)|\btee\b|\bsed\s+-i|\b(?:mv|cp|rm|mkdir|chmod|chown|scp|rsync)\b|\bgit\s+(?:commit|push|add|checkout|reset|stash|pull)/
+const readsByName = (command: unknown) =>
+  typeof command === 'string' && READ_HEAD.test(command.replace(LEAD, '')) && !WRITES.test(command)
+
 const STORE_INDEX = { plugin: 'codemode', key: 'keys' } as const
 const STORE_VALUES = { plugin: 'codemode', key: 'values' } as const
 const DESCRIPTIONS = { plugin: 'codemode', key: 'descriptions' } as const
@@ -316,6 +338,48 @@ export const register: Register = on => {
       await $.state.set({ ...DESCRIPTIONS, id: e.tool }, described.description).catch(() => undefined)
     }
     return e.tool === TOOL ? { description: described.description, isDeferred: false } : described
+  })
+
+  // The nudge. A probe is a model call to Bash, Grep or Glob that core marks
+  // read-only, or a Bash call that reads by name. The second probe in a row in
+  // one loop gets a short reminder in context, once per run of probes and
+  // NUDGE_MAX times per loop. Parallel probes count too: the engine runs each
+  // call as its block arrives, so one response cannot be told apart, and the
+  // rule says they belong in one exec anyway. Exec's own inner
+  // calls (origin codemode) and calls by other plugins are not counted.
+  // CODEMODE_NUDGE=0 turns it off.
+  const loops = new Map<string, Loop>()
+  const loopOf = (id: string) => {
+    let loop = loops.get(id)
+    if (!loop) loops.set(id, (loop = { probes: 0, isNudged: false, nudges: 0 }))
+    return loop
+  }
+  let isNudgeOn: boolean | undefined
+  on('prompt.submit', async ($, e, next) => {
+    loopOf(MAIN_LOOP).probes = 0
+    return next(e)
+  })
+  on('tool.call', async ($, e, next) => {
+    if (next.origin.plugin !== 'engine') return next(e)
+    isNudgeOn ??= (await $.env.get('CODEMODE_NUDGE').catch(() => undefined)) !== '0'
+    const loop = loopOf(e.agentId ?? MAIN_LOOP)
+    if (!PROBE_TOOLS.has(e.tool)) {
+      if (!NEUTRAL_TOOLS.has(e.tool)) loop.probes = 0
+      return next(e)
+    }
+    const r = await next(e)
+    const input = e as { run_in_background?: unknown; command?: unknown }
+    const isRead = r.isReadOnly === true || (e.tool === 'Bash' && readsByName(input.command))
+    if (r.deny !== undefined || !isRead || input.run_in_background === true) {
+      loop.probes = 0
+      return r
+    }
+    loop.probes += 1
+    if (loop.probes === 1) loop.isNudged = false
+    if (!isNudgeOn || loop.probes < 2 || loop.isNudged || loop.nudges >= NUDGE_MAX) return r
+    loop.isNudged = true
+    loop.nudges += 1
+    return { ...r, context: [...(r.context ?? []), NUDGE] }
   })
 
   on('session.end', async ($, e, next) => {
