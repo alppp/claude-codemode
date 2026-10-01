@@ -42,7 +42,7 @@ The program is the body of an async function: use await and return. Strings come
 
 Globals:
 - sh(cmd, opts?) or sh\`cmd \${x}\`: { ok, code, out, saved? }. A non-zero exit is data, so one empty grep does not stop a batch (no match: code 1, meaning "No matches found"). A deny or Bash timeout throws. Template values become single-quoted words; arrays give one word per item. opts go to Bash (timeout ms, description).
-- ssh(host, script, opts?) or ssh(host)\`...\`: { ok, code, out, host, timedOut }. The script goes to remote bash on stdin: no extra quoting. Give stdin readers </dev/null. opts.timeout in s, default 90. Exit 255: ssh failed.
+- ssh(host, script, opts?) or ssh(host)\`...\`: { ok, code, out, host, timedOut }. The script goes to remote bash on stdin: no extra quoting. Give stdin readers </dev/null. Auto mode may deny an inline script with \${...} next to quotes: keep such a script in a file. opts.timeout in s, default 90. Exit 255: ssh failed.
 - bash(cmd, opts?): stdout. A non-zero exit throws ToolError.
 - read(path, { offset, limit }?): content without line numbers. Big files are paged up to about 48k tokens; a cut read ends with a "[codemode: read stopped at line N ...]" line.
 - tools.Name(input): the tool's text; throws ToolError. call(name, input): { text, result, isError, deny }; never throws.
