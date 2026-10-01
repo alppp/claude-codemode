@@ -12,6 +12,11 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 const MARK = '\u001ecm '
 const MAX_VALUE = 2_000_000
 const MAX_LOGS = 1_000_000
+// read() paging. 48k tokens at about 3 chars per token, a safe guess for dense text.
+const READ_CAP = 144_000
+const PAGE_TOKENS = 20_000
+const PAGE_CHARS = 48_000
+const TOO_BIG = /exceeds maximum allowed (size|tokens)/
 
 function runMain() {
   const runDir = process.argv[2]
@@ -122,7 +127,7 @@ function runProgram(source) {
   })
 
   let seq = 0
-  const call = (tool, input = {}) => {
+  const request = (tool, input = {}, quiet = false) => {
     let clean
     try {
       clean = JSON.parse(JSON.stringify(input ?? {}))
@@ -138,17 +143,21 @@ function runProgram(source) {
     const id = ++seq
     return new Promise(resolve => {
       waiting.set(id, resolve)
-      post({ type: 'call', id, tool, input: clean })
+      post({ type: 'call', id, tool, input: clean, quiet })
     })
   }
+  const call = (tool, input = {}) => request(tool, input)
 
-  const ok = async (tool, input) => {
-    const r = await call(tool, input)
+  const raise = (tool, r) => {
     const own = tool.startsWith('$')
     if (r.deny !== undefined) throw new ToolError(`${tool} denied: ${r.deny}`, { tool, deny: r.deny })
     if (r.isError) {
       throw new ToolError(own ? r.text : `${tool} failed: ${r.text}`, { tool, text: r.text, result: r.result })
     }
+  }
+  const ok = async (tool, input) => {
+    const r = await call(tool, input)
+    raise(tool, r)
     return r
   }
 
@@ -161,9 +170,61 @@ function runProgram(source) {
           : undefined,
     },
   )
+  // A file too big for one Read is read in pages. Each page asks for about
+  // PAGE_CHARS, and a page over Read's token cap is retried smaller, quietly.
+  // The whole read stops near READ_CAP chars with a note line.
   const read = async (path, opts = {}) => {
-    const r = await ok('Read', { file_path: path, ...opts })
-    return r.result?.file?.content ?? r.text
+    const first = await request('Read', { file_path: path, ...opts }, true)
+    const isTooBig = first.isError && TOO_BIG.test(first.text ?? '')
+    if (!isTooBig) {
+      raise('Read', first)
+      const f = first.result?.file
+      if (!f || opts.limit !== undefined || f.startLine + f.numLines > f.totalLines) return f?.content ?? first.text
+      return readPages(path, opts, f)
+    }
+    return readPages(path, opts)
+  }
+  const readPages = async (path, opts, head) => {
+    const start = Math.max(1, Number(opts.offset) || 1)
+    const end = opts.limit === undefined ? Infinity : start + Math.max(1, Number(opts.limit)) - 1
+    const parts = []
+    let chars = 0
+    let line = start
+    let size = 2000
+    let total
+    let note
+    const take = f => {
+      total = f.totalLines
+      const lines = f.content.split('\n').slice(0, f.numLines)
+      let kept = 0
+      while (kept < lines.length && chars + lines[kept].length + 1 <= READ_CAP) chars += lines[kept++].length + 1
+      parts.push(...lines.slice(0, kept))
+      line += kept
+      if (kept < lines.length) note = 'the 48k-token cap of read()'
+      else if (kept) size = Math.min(2000, Math.max(1, Math.floor(PAGE_CHARS / (f.content.length / kept))))
+    }
+    if (head) take(head)
+    while (!note && line <= end && (total === undefined || line <= total)) {
+      const want = Math.min(size, end - line + 1, total === undefined ? Infinity : total - line + 1)
+      const r = await request('Read', { ...opts, file_path: path, offset: line, limit: want }, true)
+      if (r.isError && TOO_BIG.test(r.text ?? '')) {
+        if (want === 1) {
+          note = `line ${line} alone is over the token cap of one Read`
+          break
+        }
+        const tokens = Number(/\((\d+) tokens\)/.exec(r.text)?.[1])
+        size = tokens > 0 ? Math.max(1, Math.floor((want * PAGE_TOKENS) / tokens)) : Math.max(1, want >> 1)
+        continue
+      }
+      raise('Read', r)
+      const f = r.result?.file
+      if (!f?.numLines) break
+      take(f)
+    }
+    const text = parts.join('\n')
+    if (!note) return text
+    const of = total === undefined ? '' : ` of ${total}`
+    return `${text}\n[codemode: read stopped at line ${line}${of}: ${note}. Pass { offset: ${line} } to read on.]`
   }
   const bash = async (command, opts = {}) => {
     const r = await ok('Bash', { command, ...opts })

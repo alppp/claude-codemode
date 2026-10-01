@@ -34,7 +34,7 @@ The program is the body of an async function: use await and return. A string com
 Globals:
 - tools.Name(input): the tool's text. Throws ToolError on failure or deny.
 - call(name, input): { text, result, isError, deny }. Never throws.
-- read(path, { offset, limit }?): the file content, no line numbers.
+- read(path, { offset, limit }?): the file content, no line numbers. A file too big for one Read is read in pages, up to about 48k tokens. A cut read ends with a "[codemode: read stopped at line N ...]" line.
 - bash(command, opts?): stdout. A non-zero exit throws ToolError.
 - listTools(filter?): [{ name, summary }]. The filter is a substring or a RegExp.
 - describe(name): the tool's full description.
@@ -51,7 +51,9 @@ const files = (await bash("git ls-files '*.ts'")).split("\\n").filter(Boolean)
 const sizes = await Promise.all(files.map(async f => ({ f, lines: (await read(f)).split("\\n").length })))
 return sizes.sort((a, b) => b.lines - a.lines).slice(0, 10)`
 
-type Call = { type: 'call'; id: number; tool: string; input: Record<string, unknown> }
+// quiet: a read() page. When it fails on Read's size or token cap, read() pages
+// around it, so it leaves no ledger entry.
+type Call = { type: 'call'; id: number; tool: string; input: Record<string, unknown>; quiet?: boolean }
 type Done = {
   type: 'done'
   ok: boolean
@@ -289,7 +291,7 @@ export const register: Register = on => {
     let tools: { name: string; description: string }[] | undefined
     const toolList = async () => (tools ??= (await $.tool.list()).filter(t => t.name !== TOOL))
 
-    const callTool = async (tool: string, input: Record<string, unknown>): Promise<Reply> => {
+    const callTool = async (tool: string, input: Record<string, unknown>, quiet = false): Promise<Reply> => {
       if (tool === TOOL) return { deny: 'codemode cannot call itself.' }
       const entry: Entry = { tool, arg: brief(input), state: 'running' }
       ledger.push(entry)
@@ -306,6 +308,10 @@ export const register: Register = on => {
           entry.state = 'denied'
           entry.note = r.deny
           return { deny: r.deny }
+        }
+        if (quiet && r.isError === true && /exceeds maximum allowed (size|tokens)/.test(r.text ?? '')) {
+          ledger.splice(ledger.indexOf(entry), 1)
+          return { text: r.text ?? '', result: r.result, isError: true }
         }
         entry.state = r.isError === true ? 'failed' : 'ok'
         if (r.isError === true) entry.note = r.text
@@ -387,10 +393,10 @@ export const register: Register = on => {
       return { isError: true, text: `Unknown codemode request ${tool}.` }
     }
 
-    const serve = async ({ id, tool, input }: Call) => {
+    const serve = async ({ id, tool, input, quiet }: Call) => {
       let reply: Reply
       try {
-        reply = tool.startsWith('$') ? await serveOwn(tool, input ?? {}) : await callTool(tool, input ?? {})
+        reply = tool.startsWith('$') ? await serveOwn(tool, input ?? {}) : await callTool(tool, input ?? {}, quiet === true)
       } catch (err) {
         reply = { isError: true, text: err instanceof Error ? err.message : String(err) }
       }
