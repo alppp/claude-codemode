@@ -43,7 +43,7 @@ Globals:
 - call(name, input): { text, result, isError, deny }. Never throws.
 - read(path, { offset, limit }?): the file content, no line numbers. A file too big for one Read is read in pages, up to about 48k tokens. A cut read ends with a "[codemode: read stopped at line N ...]" line.
 - bash(command, opts?): stdout. A non-zero exit throws ToolError.
-- sh(command, opts?) or sh\`cmd \${x}\`: { ok, code, out }. A non-zero exit is data. A deny or a Bash timeout throws ToolError. In the template form, each \${x} becomes one single-quoted word, and an array becomes one word per item. opts go to Bash (timeout in ms, description). sh(opts)\`cmd\` also works.
+- sh(command, opts?) or sh\`cmd \${x}\`: { ok, code, out }. A non-zero exit is data. A grep or rg with no match gives code 1 and meaning "No matches found". A deny or a Bash timeout throws ToolError. In the template form, each \${x} becomes one single-quoted word, and an array becomes one word per item. opts go to Bash (timeout in ms, description). sh(opts)\`cmd\` also works.
 - ssh(host, script, opts?) or ssh(host)\`cmd \${x}\`: { ok, code, out, host, timedOut }. The script runs in bash on the host. It goes over stdin, so it needs no extra quoting. A command in it that reads stdin eats the rest of the script: give that command </dev/null. opts.timeout is in seconds, default 90. Exit 255 is an ssh failure.
 - q(...words): the words in POSIX single quotes, joined by spaces. Arrays flatten.
 - listTools(filter?): [{ name, summary }]. The filter is a substring or a RegExp.

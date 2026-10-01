@@ -296,7 +296,12 @@ function runProgram({ source, preludes, projectDir }) {
       })
     }
     if (res.backgroundTaskId) return own({ ok: true, code: 0, out: r.text })
-    const value = { ok: true, code: 0, out: res.stdout ?? r.text }
+    // Bash reports exit 1 of grep, rg, diff, test and find as a success with
+    // a meaning ("No matches found"). Give the real exit back.
+    const meaning = res.returnCodeInterpretation
+    const value = meaning
+      ? { ok: false, code: 1, out: res.stdout ?? r.text, meaning }
+      : { ok: true, code: 0, out: res.stdout ?? r.text }
     if (res.persistedOutputPath) value.saved = res.persistedOutputPath
     return own(value)
   }
