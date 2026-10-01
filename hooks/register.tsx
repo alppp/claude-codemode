@@ -36,7 +36,7 @@ const EXPANDED = { plugin: 'codemode', key: 'expanded' } as const
 const MAX_DESCRIPTION = 4000
 const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value, console lines and a call ledger come back.
 
-Use it for 3 or more calls, fan-out, or big outputs you filter in code. For an investigation, put every independent probe in the first exec. One small call: use the tool directly. Builds, deploys and jobs over about a minute: Bash with run_in_background.
+Use it for every read-only probe (rg, ssh, sed, cat, Mongo, reads of files you will not edit) when another probe may follow, even if this one is a single call. Before the first probe, list what you need to know, then fetch every independent part in one exec. Use plain Bash only for writes and for jobs over about a minute (run_in_background).
 
 The program is the body of an async function: use await and return. Strings come back as is, other values as JSON, long multi-line strings as raw sections. TS types are stripped; enum and namespace fail. No Node APIs: all I/O goes through tools, under the normal permissions.
 
