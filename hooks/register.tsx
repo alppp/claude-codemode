@@ -1,6 +1,7 @@
+import { update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CodemodeJson } from '../types'
+import type { CodemodeJson, CodemodeRun } from '../types'
 
 const TOOL = 'mcp__codemode__exec'
 const MARK = '\u001ecm '
@@ -21,6 +22,8 @@ const GUEST_PATH = 'PATH=/usr/local/bin:/usr/bin:/bin'
 const STORE_INDEX = { plugin: 'codemode', key: 'keys' } as const
 const STORE_VALUES = { plugin: 'codemode', key: 'values' } as const
 const DESCRIPTIONS = { plugin: 'codemode', key: 'descriptions' } as const
+const RUNS = { plugin: 'codemode', key: 'runs' } as const
+const EXPANDED = { plugin: 'codemode', key: 'expanded' } as const
 
 const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value and console lines come back to you.
 
@@ -79,6 +82,35 @@ const cutMiddle = (text: string, max: number) => {
   const head = text.slice(0, Math.ceil(keep / 2))
   const tail = text.slice(text.length - Math.floor(keep / 2))
   return `${head}\n[... ${text.length - head.length - tail.length} chars cut here ...]\n${tail}`
+}
+
+// The row's label when the model gave no title: the program's first code line.
+const headline = (program: string) =>
+  oneLine(program.split('\n').find(l => l.trim() && !/^\s*(\/\/|\/\*|\*)/.test(l)) ?? '', 80)
+
+// The text of a stored result: a string, or text content blocks.
+const outputText = (output: unknown): string | undefined => {
+  if (typeof output === 'string') return output
+  const blocks = Array.isArray(output)
+    ? output
+    : (output as { content?: unknown } | null)?.content
+  if (!Array.isArray(blocks)) return undefined
+  return blocks.map(b => (typeof b?.text === 'string' ? b.text : '')).join('\n')
+}
+
+// The ledger footer starts at the line "calls: N (...)".
+const splitFooter = (text: string) => {
+  const at = text.search(/\n\ncalls: \d+ \(/)
+  return at < 0 ? { body: text, footer: '' } : { body: text.slice(0, at), footer: text.slice(at + 2) }
+}
+
+const runMeta = (run: CodemodeRun | undefined, isRunning: boolean) => {
+  if (!run) return isRunning ? 'running' : ''
+  const parts = [`${run.calls} call${run.calls === 1 ? '' : 's'}`]
+  if (run.failed) parts.push(`${run.failed} failed`)
+  if (run.denied) parts.push(`${run.denied} denied`)
+  parts.push(`${run.seconds}s`)
+  return isRunning ? `running · ${parts.join(' · ')}` : parts.join(' · ')
 }
 
 const summary = (description: string) => oneLine(description.split(/(?<=\.)\s|\n/)[0] ?? '', 160)
@@ -172,7 +204,7 @@ export const register: Register = on => {
             type: 'number',
             description: `Program-time limit in seconds. Waiting on tools does not count. Default ${DEFAULT_TIMEOUT_S}, max ${MAX_TIMEOUT_S}.`,
           },
-          title: { type: 'string', description: 'Short label for the status line while the program runs.' },
+          title: { type: 'string', description: 'A 3 to 6 word label for the transcript row and the status line.' },
         },
         required: ['program'],
       },
@@ -211,6 +243,8 @@ export const register: Register = on => {
     const timeoutS = Math.min(Math.max(Number(e.timeoutSeconds) || DEFAULT_TIMEOUT_S, 1), MAX_TIMEOUT_S)
     const title = typeof e.title === 'string' ? oneLine(e.title, 60) : ''
     const sessionId = await $.session.id()
+    const runRef = { ...RUNS, id: e.tool_use_id }
+    const startedAt = await $.clock.now()
 
     nodePath ??= (await $.process.run(['sh', '-c', 'command -v node'])).stdout.trim() || 'node'
     if (guestPath === undefined) {
@@ -221,8 +255,25 @@ export const register: Register = on => {
 
     const ledger: Entry[] = []
     let isClosed = false
+    // The transcript row reads this, so it redraws as calls come and go.
+    const publish = async (isDone = false, isOk = true) => {
+      const seconds = Math.round(((await $.clock.now()) - startedAt) / 100) / 10
+      const count = (state: Entry['state']) => ledger.filter(c => c.state === state).length
+      const run: CodemodeRun = {
+        title: title || headline(program),
+        calls: ledger.length,
+        failed: count('failed'),
+        denied: count('denied'),
+        isDone,
+        isOk,
+        seconds,
+      }
+      await $.state.set(runRef, run).catch(() => undefined)
+    }
     const showStatus = () => {
-      if (!isClosed) $.ui.status(`codemode: ${title ? `${title} · ` : ''}${ledger.length} calls`)
+      if (isClosed) return
+      $.ui.status(`codemode: ${title ? `${title} · ` : ''}${ledger.length} calls`)
+      void publish()
     }
 
     let active = 0
@@ -268,6 +319,7 @@ export const register: Register = on => {
         return { isError: true, text }
       } finally {
         release()
+        if (!isClosed) void publish()
       }
     }
 
@@ -417,6 +469,7 @@ export const register: Register = on => {
     }
 
     const isFailed = !done?.ok
+    await publish(true, !isFailed)
     let head: string
     if (done?.ok) head = done.value ?? ''
     else if (done?.kind === 'parse') head = done.error ?? 'Program did not parse.'
@@ -457,5 +510,74 @@ export const register: Register = on => {
     const room = cap - logsShown.length - footer.length - notice.length - 8
     const text = [cutMiddle(head, Math.max(room, 1000)), logsShown, footer, notice].filter(Boolean).join('\n\n')
     return answer(text)
+  })
+
+  // The transcript row: one header line, then at most two result lines.
+  // A click on the last line opens the program and the full output.
+  on('ui.render', { component: 'ToolUse', props: { tool: TOOL } }, async ($, e, next) => {
+    if (e.props.isInterrupted) return next(e)
+    const run = (await $.state.get({ ...RUNS, id: e.requestId }).catch(() => undefined))?.value
+    const isOpen = (await $.state.get({ ...EXPANDED, id: e.requestId }).catch(() => undefined))?.value === true
+    const input = (e.props.input ?? {}) as { program?: unknown; title?: unknown }
+    const program = typeof input.program === 'string' ? input.program : ''
+    const title = run?.title ?? (typeof input.title === 'string' && input.title ? oneLine(input.title, 60) : headline(program))
+    const isBad = e.props.isErrored || (run?.isDone === true && !run.isOk)
+    const dot = e.props.isRunning ? 'yellow' : isBad ? 'red' : 'green'
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="row">
+          <Text color={dot}>● </Text>
+          <Text bold>codemode </Text>
+          <Text wrap="truncate">{title}</Text>
+          <Text dimColor wrap="truncate"> · {runMeta(run, e.props.isRunning)}</Text>
+        </Box>
+        {isOpen ? (
+          <Box paddingLeft={2}>
+            <Text dimColor>{program}</Text>
+          </Box>
+        ) : null}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'ToolResult', props: { tool: TOOL } }, async ($, e, next) => {
+    if (e.props.isErrored) return next(e)
+    const text = outputText(e.props.output)
+    if (text === undefined) return next(e)
+    const ref = { ...EXPANDED, id: e.requestId }
+    const isOpen = (await $.state.get(ref).catch(() => undefined))?.value === true
+    const { body, footer } = splitFooter(text)
+    const lines = body.split('\n')
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const toggle = () => update($, ref, v => !v)
+    if (isOpen) {
+      return (
+        <Box flexDirection="column" paddingLeft={2}>
+          <Text>{text}</Text>
+          <Button key="toggle" plain dimColor label="collapse" onPress={toggle} />
+        </Box>
+      )
+    }
+    const first = lines.find(l => l.trim()) ?? '(empty)'
+    const rest = lines.filter(l => l.trim()).length - 1
+    const ledger = footer.split('\n')[0] ?? ''
+    const failed = /failed: (?!none)/.test(ledger) ? ledger.replace(/^.*?; (failed: .*?); denied.*$/, '$1') : ''
+    return (
+      <Box flexDirection="column" paddingLeft={2}>
+        <Text wrap="truncate">⎿  {first}</Text>
+        {rest > 0 || footer ? (
+          <Box paddingLeft={3}>
+            <Button
+              key="toggle"
+              plain
+              dimColor
+              label={`${rest > 0 ? `+${rest} line${rest === 1 ? '' : 's'}` : 'details'}${failed ? ` · ${oneLine(failed, 80)}` : ''} · expand`}
+              onPress={toggle}
+            />
+          </Box>
+        ) : null}
+      </Box>
+    )
   })
 }

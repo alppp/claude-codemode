@@ -1,1 +1,1 @@
-{ "name": "codemode", "version": "0.2.0", "description": "One tool that runs a JS/TS program which calls Claude Code tools and returns only the result.", "types": "./types/index.d.ts" }
+{ "name": "codemode", "version": "0.3.0", "description": "One tool that runs a JS/TS program which calls Claude Code tools and returns only the result.", "types": "./types/index.d.ts" }
