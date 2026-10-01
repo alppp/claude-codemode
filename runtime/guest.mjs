@@ -4,6 +4,7 @@
 // JSON lines, and the mod answers each one with a file r<id>.json in the run
 // folder. The program runs in a worker, inside a vm context that holds only
 // the codemode globals. The main thread stops the worker at the soft timeout.
+// Prelude files from the host run in the same context before the program.
 import fs from 'node:fs'
 import vm from 'node:vm'
 import { stripTypeScriptTypes } from 'node:module'
@@ -17,6 +18,29 @@ const READ_CAP = 144_000
 const PAGE_TOKENS = 20_000
 const PAGE_CHARS = 48_000
 const TOO_BIG = /exceeds maximum allowed (size|tokens)/
+// sh() and ssh(). Bash answers a non-zero exit with isError and the text
+// "Exit code N", then the output. Bash's own timeout or kill is not data.
+const EXIT = /^Exit code (-?\d+)\n?/
+const BASH_KILLED = /Command timed out after |Command killed: /
+const SSH_TIMEOUT_S = 90
+const MAX_BASH_MS = 600_000
+const DOC_LINE = /^\/\/: (.*?)\r?$/
+
+// The host sends { program, preludes, projectDir } as JSON. A bare program
+// is the older form.
+function envelope(text) {
+  try {
+    const v = JSON.parse(text)
+    if (v !== null && typeof v === 'object' && typeof v.program === 'string') {
+      return {
+        source: v.program,
+        preludes: Array.isArray(v.preludes) ? v.preludes : [],
+        projectDir: typeof v.projectDir === 'string' ? v.projectDir : null,
+      }
+    }
+  } catch {}
+  return { source: text, preludes: [], projectDir: null }
+}
 
 function runMain() {
   const runDir = process.argv[2]
@@ -43,7 +67,7 @@ function runMain() {
   }
 
   const worker = new Worker(new URL(import.meta.url), {
-    workerData: { source: fs.readFileSync(0, 'utf8') },
+    workerData: envelope(fs.readFileSync(0, 'utf8')),
   })
   worker.on('message', msg => {
     if (msg.type === 'call') {
@@ -91,13 +115,16 @@ function runMain() {
   }, 100)
 }
 
-function runProgram(source) {
+function runProgram({ source, preludes, projectDir }) {
   const post = msg => parentPort.postMessage(msg)
+  // Note lines for the result, one per skipped prelude.
+  const notes = []
   let ended = false
   const end = msg => {
     if (ended) return
     ended = true
-    post({ type: 'done', ...msg })
+    const note = [msg.note, ...notes].filter(Boolean).join('\n') || undefined
+    post({ type: 'done', ...msg, note })
   }
 
   const log = (...args) =>
@@ -108,6 +135,8 @@ function runProgram(source) {
   // instanceof Error, Array and Object work in the program.
   const context = vm.createContext({})
   const fromJson = vm.runInContext('JSON.parse', context)
+  const own = value => fromJson(JSON.stringify(value))
+  const GuestTypeError = vm.runInContext('TypeError', context)
   const ToolError = vm.runInContext(
     `(class ToolError extends Error {
       constructor(message, info = {}) {
@@ -127,7 +156,9 @@ function runProgram(source) {
   })
 
   let seq = 0
-  const request = (tool, input = {}, quiet = false) => {
+  // extra: quiet (a read() page), soft (sh and ssh) and label (the ledger
+  // argument in place of the command head).
+  const request = (tool, input = {}, extra = {}) => {
     let clean
     try {
       clean = JSON.parse(JSON.stringify(input ?? {}))
@@ -143,7 +174,7 @@ function runProgram(source) {
     const id = ++seq
     return new Promise(resolve => {
       waiting.set(id, resolve)
-      post({ type: 'call', id, tool, input: clean, quiet })
+      post({ type: 'call', id, tool, input: clean, ...extra })
     })
   }
   const call = (tool, input = {}) => request(tool, input)
@@ -174,7 +205,7 @@ function runProgram(source) {
   // PAGE_CHARS, and a page over Read's token cap is retried smaller, quietly.
   // The whole read stops near READ_CAP chars with a note line.
   const read = async (path, opts = {}) => {
-    const first = await request('Read', { file_path: path, ...opts }, true)
+    const first = await request('Read', { file_path: path, ...opts }, { quiet: true })
     const isTooBig = first.isError && TOO_BIG.test(first.text ?? '')
     if (!isTooBig) {
       raise('Read', first)
@@ -206,7 +237,7 @@ function runProgram(source) {
     if (head) take(head)
     while (!note && line <= end && (total === undefined || line <= total)) {
       const want = Math.min(size, end - line + 1, total === undefined ? Infinity : total - line + 1)
-      const r = await request('Read', { ...opts, file_path: path, offset: line, limit: want }, true)
+      const r = await request('Read', { ...opts, file_path: path, offset: line, limit: want }, { quiet: true })
       if (r.isError && TOO_BIG.test(r.text ?? '')) {
         if (want === 1) {
           note = `line ${line} alone is over the token cap of one Read`
@@ -231,6 +262,78 @@ function runProgram(source) {
     if (r.result?.backgroundTaskId) return r.text
     return r.result?.stdout ?? r.text
   }
+
+  // POSIX single quotes. An array gives one word per item.
+  const word = v => {
+    if (v === null || !['string', 'number', 'bigint', 'boolean'].includes(typeof v)) {
+      throw new GuestTypeError(`q: ${v === null ? 'null' : typeof v} is not a shell word. Pass strings, numbers or arrays of them.`)
+    }
+    return `'${String(v).replaceAll("'", `'\\''`)}'`
+  }
+  const q = (...words) => words.flat(Infinity).map(word).join(' ')
+  const isTemplate = v => Array.isArray(v) && Array.isArray(v.raw)
+  const isOptions = v => v !== null && typeof v === 'object' && !Array.isArray(v)
+  // The raw text of a template, so a backslash reaches the shell as typed.
+  const fill = (strings, values) =>
+    strings.raw.map((s, i) => (i < values.length ? s + q(values[i]) : s)).join('')
+
+  // A Bash call where a plain non-zero exit is data. Bash cuts stdout at
+  // 30000 chars and saves the full text to a file, given as saved.
+  const shell = async (command, opts = {}, label) => {
+    const r = await request('Bash', { command, ...opts }, { soft: true, label })
+    const exit = r.isError && r.deny === undefined ? EXIT.exec(r.text ?? '') : null
+    const code = Number(exit?.[1])
+    if (exit && !((code === 143 || code === 137) && BASH_KILLED.test(r.text))) {
+      return own({ ok: false, code, out: r.text.slice(exit[0].length) })
+    }
+    raise('Bash', r)
+    const res = r.result ?? {}
+    if (res.timedOutAfterMs !== undefined) {
+      throw new ToolError(`Bash timed out after ${res.timedOutAfterMs / 1000} s and moved the command to the background: ${r.text}`, {
+        tool: 'Bash',
+        text: r.text,
+        result: r.result,
+      })
+    }
+    if (res.backgroundTaskId) return own({ ok: true, code: 0, out: r.text })
+    const value = { ok: true, code: 0, out: res.stdout ?? r.text }
+    if (res.persistedOutputPath) value.saved = res.persistedOutputPath
+    return own(value)
+  }
+  const sh = (command, ...rest) => {
+    if (isTemplate(command)) return shell(fill(command, rest))
+    if (isOptions(command)) return (strings, ...values) => shell(fill(strings, values), command)
+    if (typeof command !== 'string') {
+      return Promise.reject(new GuestTypeError('sh(command, opts?) takes a command string. Or write sh`...`.'))
+    }
+    return shell(command, rest[0])
+  }
+
+  // One local Bash call. The script goes to the remote bash on stdin from a
+  // quoted heredoc, so it needs no remote quoting.
+  const sshRun = async (host, script, opts) => {
+    if (typeof host !== 'string' || !host) throw new GuestTypeError('ssh(host, script, opts?) takes a host name first.')
+    if (typeof script !== 'string') {
+      throw new GuestTypeError('ssh(host, script, opts?) takes the script as a string. Or write ssh(host)`...`.')
+    }
+    const { timeout, ...rest } = opts ?? {}
+    const seconds = Number(timeout) > 0 ? Number(timeout) : SSH_TIMEOUT_S
+    let tag
+    do tag = `CM_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`
+    while (script.includes(tag))
+    const label = `ssh ${host}: ${script.split('\n').find(l => l.trim())?.trim() ?? ''}`
+    const command =
+      `timeout -k 5 ${seconds} ssh -o BatchMode=yes -o ConnectTimeout=10 ${q(host)} bash -s <<'${tag}'\n` +
+      `${script}\n${tag}`
+    const bashOpts = { description: oneLine(label, 80), ...rest, timeout: Math.min(MAX_BASH_MS, (seconds + 15) * 1000) }
+    const r = await shell(command, bashOpts, label)
+    return own({ ...r, host, timedOut: r.code === 124 || r.code === 137 })
+  }
+  const ssh = (host, script, opts) =>
+    script === undefined || isOptions(script)
+      ? (strings, ...values) => sshRun(host, fill(strings, values), script)
+      : sshRun(host, script, opts)
+
   const listTools = async filter => {
     const all = (await ok('$list', {})).result
     if (filter === undefined) return all
@@ -265,9 +368,13 @@ function runProgram(source) {
     keys: async () => (await ok('$store', { op: 'keys' })).result,
   }
 
+  const docs = []
+  const helpers = () => own(docs)
+
   let isLastHit = false
   Object.assign(context, {
-    tools, call, read, bash, listTools, describe, store, console: guestConsole, ToolError,
+    tools, call, read, bash, sh, ssh, q, listTools, describe, store, helpers, projectDir,
+    console: guestConsole, ToolError,
     setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask, structuredClone,
     URL, URLSearchParams, TextEncoder, TextDecoder, atob, btoa,
     [LAST]: v => ((isLastHit = true), v),
@@ -283,6 +390,27 @@ function runProgram(source) {
   const fail = (lead, err) => end({ ok: false, kind: 'error', error: lead + describeError(err, prepared) })
   process.on('unhandledRejection', err => fail('Unhandled promise rejection: ', err))
   process.on('uncaughtException', err => fail('Uncaught exception: ', err))
+
+  // Each prelude runs as a script in the program's context, so its top-level
+  // declarations are globals for the program. A prelude that throws is skipped.
+  for (const p of preludes) {
+    if (typeof p?.path !== 'string') continue
+    if (typeof p.source !== 'string') {
+      notes.push(`prelude ${p.path} skipped: ${p.error ?? 'no source'}`)
+      continue
+    }
+    preludeFiles.add(p.path)
+    try {
+      const code = p.path.endsWith('.ts') ? stripTypeScriptTypes(p.source, { mode: 'strip' }) : p.source
+      new vm.Script(code, { filename: p.path }).runInContext(context)
+      for (const line of p.source.split('\n')) {
+        const doc = DOC_LINE.exec(line)
+        if (doc) docs.push(doc[1])
+      }
+    } catch (err) {
+      notes.push(`prelude ${p.path} skipped: ${preludeError(err, p.path)}`)
+    }
+  }
 
   void (async () => {
     try {
@@ -375,8 +503,8 @@ function spliceLast(body) {
 // Errors.
 
 const GLOBALS =
-  'In scope: tools, call, read, bash, listTools, describe, store, console, ToolError, setTimeout, and the standard JavaScript built-ins.'
-const NODE_HINT = 'There are no Node APIs here. Do I/O through tools: read(), bash(), tools.Name().'
+  'In scope: tools, call, read, bash, sh, ssh, q, listTools, describe, store, helpers, projectDir, console, ToolError, setTimeout, the prelude helpers, and the standard JavaScript built-ins.'
+const NODE_HINT = 'There are no Node APIs here. Do I/O through tools: read(), sh(), ssh(), tools.Name().'
 const NODE_NAMES = /^(require|process|Buffer|fetch|module|exports|__dirname|__filename|global)\b/
 
 function codeFrame(at, line, column) {
@@ -432,7 +560,10 @@ function parseError(err, at, from) {
   return out.join('\n')
 }
 
-const FRAME = /^\s*at (?:async )?(?:(.*?) \()?program:(\d+):(\d+)\)?$/
+// A stack frame in the program or in a prelude file. Other frames are
+// codemode's own and stay hidden.
+const FRAME = /^\s*at (?:async )?(?:(.*?) \()?(.+?):(\d+):(\d+)\)?$/
+const preludeFiles = new Set()
 
 function describeError(err, at) {
   const isErrorLike = err !== null && typeof err === 'object' && typeof err.message === 'string'
@@ -441,14 +572,18 @@ function describeError(err, at) {
   const out = [`${name}: ${err.message}`]
   for (const frame of String(err.stack ?? '').split('\n')) {
     const m = FRAME.exec(frame)
-    if (!m) continue
-    const line = Number(m[2])
-    let column = Number(m[3])
-    if (at.splice && line === at.splice.line && column > at.splice.indent) {
-      column = Math.max(column - PREFIX.length, at.splice.indent + 1)
-    }
+    if (!m || (m[2] !== 'program' && !preludeFiles.has(m[2]))) continue
+    const line = Number(m[3])
+    let column = Number(m[4])
     const fn = m[1] && m[1] !== 'codemode' ? `${m[1]} ` : ''
-    out.push(`  at ${fn}line ${line}:${column}`)
+    if (m[2] !== 'program') {
+      out.push(`  at ${fn}${m[2]}:${line}:${column}`)
+    } else {
+      if (at.splice && line === at.splice.line && column > at.splice.indent) {
+        column = Math.max(column - PREFIX.length, at.splice.indent + 1)
+      }
+      out.push(`  at ${fn}line ${line}:${column}`)
+    }
     if (out.length > 6) break
   }
   const missing = name === 'ReferenceError' ? /^(\S+) is not defined/.exec(err.message)?.[1] : undefined
@@ -459,6 +594,33 @@ function describeError(err, at) {
     out.push(NODE_HINT)
   }
   return out.join('\n')
+}
+
+// One line for a prelude that did not run: the error and where it is.
+function preludeError(err, path) {
+  const name = typeof err?.name === 'string' ? err.name : 'Error'
+  const message = String(err?.message ?? err).split('\n')[0]
+  const stack = String(err?.stack ?? '')
+  let where
+  // A parse error starts its stack with "<file>:<line>", the source line and a caret line.
+  const head = /^[^\n]*:(\d+)\n[^\n]*\n([^\n]*)/.exec(stack)
+  if (head && !/^\s*at /.test(head[2])) {
+    where = head[2].includes('^') ? `${head[1]}:${head[2].indexOf('^') + 1}` : head[1]
+  } else {
+    for (const frame of stack.split('\n')) {
+      const m = FRAME.exec(frame)
+      if (m && m[2] === path) {
+        where = `${m[3]}:${m[4]}`
+        break
+      }
+    }
+  }
+  return `${name}: ${message}${where ? ` (line ${where})` : ''}`
+}
+
+const oneLine = (text, max) => {
+  const line = text.replace(/\s+/g, ' ').trim()
+  return line.length > max ? `${line.slice(0, Math.max(0, max - 3))}...` : line
 }
 
 function show(v) {
@@ -526,4 +688,4 @@ function format(value) {
 }
 
 if (isMainThread) runMain()
-else runProgram(workerData.source)
+else runProgram(workerData)

@@ -18,6 +18,13 @@ const MAX_STDERR = 4096
 const STORE_KEYS = 256
 const STORE_VALUE = 1_000_000
 const GUEST_PATH = 'PATH=/usr/local/bin:/usr/bin:/bin'
+const DOC_CAP = 1500
+// A soft call (sh, ssh) that ends in "Exit code N" is data. Bash's own
+// timeout or kill still fails.
+const EXIT = /^Exit code (-?\d+)/
+const BASH_KILLED = /Command timed out after |Command killed: /
+const PRELUDE_FILE = /^(?!.*\.d\.ts$).+\.(js|ts)$/
+const DOC_LINE = /^\/\/: (.*?)\r?$/
 
 const STORE_INDEX = { plugin: 'codemode', key: 'keys' } as const
 const STORE_VALUES = { plugin: 'codemode', key: 'values' } as const
@@ -27,7 +34,7 @@ const EXPANDED = { plugin: 'codemode', key: 'expanded' } as const
 
 const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value and console lines come back to you.
 
-Use it for 3 or more calls, fan-out over many files or commands, or big outputs you filter in code. For one small call, call the tool directly. Exec waits for every inner call, and your turn blocks until then. Run builds, deploys, big syncs and anything over about a minute with the Bash tool and run_in_background, several at once when they are independent.
+Use it for 3 or more calls, fan-out over many files or commands, or big outputs you filter in code. For one small call, call the tool directly. For an investigation, put every independent probe in the first exec. sh() and ssh() return a non-zero exit as data, so one empty grep does not stop the batch. Exec waits for every inner call, and your turn blocks until then. Run builds, deploys, big syncs and anything over about a minute with the Bash tool and run_in_background, several at once when they are independent.
 
 The program is the body of an async function: use await and return. A string comes back as is, other values as JSON. Long multi-line strings come back as raw sections. TypeScript types are stripped, not checked; enum and namespace fail. The program has no file system, network or process access. All I/O goes through tools, under the normal permissions and hooks.
 
@@ -36,24 +43,43 @@ Globals:
 - call(name, input): { text, result, isError, deny }. Never throws.
 - read(path, { offset, limit }?): the file content, no line numbers. A file too big for one Read is read in pages, up to about 48k tokens. A cut read ends with a "[codemode: read stopped at line N ...]" line.
 - bash(command, opts?): stdout. A non-zero exit throws ToolError.
+- sh(command, opts?) or sh\`cmd \${x}\`: { ok, code, out }. A non-zero exit is data. A deny or a Bash timeout throws ToolError. In the template form, each \${x} becomes one single-quoted word, and an array becomes one word per item. opts go to Bash (timeout in ms, description). sh(opts)\`cmd\` also works.
+- ssh(host, script, opts?) or ssh(host)\`cmd \${x}\`: { ok, code, out, host, timedOut }. The script runs in bash on the host. It goes over stdin, so it needs no extra quoting. A command in it that reads stdin eats the rest of the script: give that command </dev/null. opts.timeout is in seconds, default 90. Exit 255 is an ssh failure.
+- q(...words): the words in POSIX single quotes, joined by spaces. Arrays flatten.
 - listTools(filter?): [{ name, summary }]. The filter is a substring or a RegExp.
 - describe(name): the tool's full description.
 - store.get(key), store.set(key, value), store.delete(key), store.keys(): JSON values kept across exec calls in this session (256 keys, 1 MB each). Only exec sees them. Bash does not.
+- helpers(): the doc lines of the prelude files that loaded.
+- projectDir: the nearest dir at or above the launch dir that holds .codemode, else the launch dir.
 - console.log(...): lines after the result.
 - ToolError: an Error with .tool and .text.
 
-Result shapes: Read gives result.file.content. Bash gives result.stdout and result.stderr. A failed Bash call has isError true, text "Exit code N" and then the output, and no structured result. With run_in_background, Bash returns the task id at once. The completion notice comes to you, not to the program.
+Result shapes: Read gives result.file.content. Bash gives result.stdout, with stderr merged in. A failed Bash call has isError true, text "Exit code N" and then the output, and no structured result. Bash keeps the first 30000 chars of output. When it cuts more, sh() and ssh() also give saved, the path of the full output. A non-zero exit keeps 10000 of those chars, the head and the tail. With run_in_background, Bash returns the task id at once. The completion notice comes to you, not to the program.
+
+Prelude: each exec first runs ~/.claude/codemode/prelude/*.{js,ts}, then <projectDir>/.codemode/prelude/*.{js,ts}. Their top-level declarations are globals in the program. A prelude that throws is skipped, and the result says so.
 
 timeoutSeconds (default 120, max 600) counts program time only. Time spent waiting on tools and permission dialogs does not count. Up to 8 calls run at once, and 300 per run. The result ends with a ledger of the calls.
 
 Example:
-const files = (await bash("git ls-files '*.ts'")).split("\\n").filter(Boolean)
-const sizes = await Promise.all(files.map(async f => ({ f, lines: (await read(f)).split("\\n").length })))
-return sizes.sort((a, b) => b.lines - a.lines).slice(0, 10)`
+const [hits, disk, head] = await Promise.all([
+  sh\`rg -n -i \${"needle"} src\`,
+  ssh("buildhost", "df -h /; uptime"),
+  sh("git log -1 --format=%s"),
+])
+return { hits: hits.ok ? hits.out : \`no hits (exit \${hits.code})\`, disk: disk.out, head: head.out.trim() }`
 
 // quiet: a read() page. When it fails on Read's size or token cap, read() pages
-// around it, so it leaves no ledger entry.
-type Call = { type: 'call'; id: number; tool: string; input: Record<string, unknown>; quiet?: boolean }
+// around it, so it leaves no ledger entry. soft: an sh() or ssh() call.
+// label: the ledger argument in place of the command head.
+type Call = {
+  type: 'call'
+  id: number
+  tool: string
+  input: Record<string, unknown>
+  quiet?: boolean
+  soft?: boolean
+  label?: string
+}
 type Done = {
   type: 'done'
   ok: boolean
@@ -65,7 +91,9 @@ type Done = {
   programSeconds?: number
 }
 type Reply = { text?: string; result?: unknown; isError?: boolean; deny?: string }
-type Entry = { tool: string; arg: string; state: 'running' | 'ok' | 'failed' | 'denied'; note?: string }
+// exit: a soft call's non-zero exit code. Its state is ok.
+type Entry = { tool: string; arg: string; state: 'running' | 'ok' | 'failed' | 'denied'; note?: string; exit?: number }
+type Prelude = { path: string; source?: string; error?: string }
 
 const oneLine = (text: string, max: number) => {
   const line = text.replace(/\s+/g, ' ').trim()
@@ -166,7 +194,16 @@ const ledgerLine = (ledger: Entry[]) => {
       })
       .join(', ')
   }
-  return `calls: ${ledger.length} (${tally(ledger)}); failed: ${group('failed')}; denied: ${group('denied')}`
+  const nonzero = ledger.filter(c => c.exit !== undefined).length
+  const exits = nonzero ? `; nonzero exits: ${nonzero}` : ''
+  return `calls: ${ledger.length} (${tally(ledger)})${exits}; failed: ${group('failed')}; denied: ${group('denied')}`
+}
+
+// The exit code of a soft call that ended in a plain non-zero exit.
+const softExit = (text: string) => {
+  const code = Number(EXIT.exec(text)?.[1])
+  if (!Number.isInteger(code)) return undefined
+  return (code === 143 || code === 137) && BASH_KILLED.test(text) ? undefined : code
 }
 
 const progressNote = (ledger: Entry[]) => {
@@ -187,6 +224,66 @@ const droppedNote = (ledger: Entry[]) => {
 const spillDir = async ($: Pick<EngineInterface, 'env'>, sessionId: string) =>
   `${(await $.env.get('XDG_RUNTIME_DIR')) ?? '/tmp'}/codemode/${sessionId}`
 
+type Host = Pick<EngineInterface, 'env' | 'fs' | 'session'>
+
+// The nearest dir at or above the launch dir that holds .codemode. The walk
+// stops below the home dir. Without one, the launch dir itself.
+const findProject = async ($: Host, root: string, home: string | undefined) => {
+  for (let dir = root; dir && dir !== home && dir !== '/'; dir = dir.slice(0, dir.lastIndexOf('/'))) {
+    if (await $.fs.exists(`${dir}/.codemode`).catch(() => false)) return dir
+  }
+  return root
+}
+
+// The .js and .ts files of one prelude dir, sorted by name.
+const preludeDir = async ($: Host, dir: string): Promise<Prelude[]> => {
+  const entries = await $.fs.list(dir).catch(() => [])
+  const names = entries
+    .filter(f => (f.kind === 'file' || f.isLink) && PRELUDE_FILE.test(f.name))
+    .map(f => f.name)
+    .sort()
+  return Promise.all(
+    names.map(async name => {
+      const path = `${dir}/${name}`
+      try {
+        return { path, source: await $.fs.read(path) }
+      } catch (err) {
+        return { path, error: `could not read it: ${err instanceof Error ? err.message : String(err)}` }
+      }
+    }),
+  )
+}
+
+// The global prelude files, then the project's. Read again on every exec.
+const loadPreludes = async ($: Host, fallbackRoot?: string) => {
+  const home = await $.env.get('HOME')
+  const root = (await $.session.root().catch(() => undefined)) ?? fallbackRoot
+  const projectDir = root === undefined ? null : await findProject($, root, home)
+  const preludes = [
+    ...(home ? await preludeDir($, `${home}/.claude/codemode/prelude`) : []),
+    ...(projectDir ? await preludeDir($, `${projectDir}/.codemode/prelude`) : []),
+  ]
+  return { projectDir, preludes }
+}
+
+// The description's helper block: the "//: " doc lines of the prelude files
+// at session start, cut near DOC_CAP chars.
+const helperDocs = (preludes: Prelude[]) => {
+  const files = preludes
+    .map(p => ({ path: p.path, lines: (p.source ?? '').split('\n').flatMap(l => DOC_LINE.exec(l)?.[1] ?? []) }))
+    .filter(f => f.lines.length)
+  if (!files.length) return ''
+  let text = `Helpers (from ${files.map(f => f.path).join(', ')}). This list is from session start. Later edits to these files reach helpers() and the runtime, not this text.`
+  for (const line of files.flatMap(f => f.lines)) {
+    if (text.length + line.length + 3 > DOC_CAP) {
+      text += '\n- ... helpers() lists the rest.'
+      break
+    }
+    text += `\n- ${line}`
+  }
+  return text
+}
+
 export const register: Register = on => {
   let nodePath: string | undefined
   let guestPath: string | undefined
@@ -195,9 +292,11 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    const { preludes } = await loadPreludes($, e.cwd).catch(() => ({ preludes: [] }))
+    const docs = helperDocs(preludes)
     await $.tool.register({
       name: 'exec',
-      description: DESCRIPTION,
+      description: docs ? `${DESCRIPTION}\n\n${docs}` : DESCRIPTION,
       inputSchema: {
         type: 'object',
         properties: {
@@ -254,6 +353,7 @@ export const register: Register = on => {
       guestPath = (await $.fs.stat(guest, { resolve: true })).realPath ?? guest
     }
     const runDir = (await $.process.run(['mktemp', '-d', '-t', 'codemode.XXXXXX'])).stdout.trim()
+    const { projectDir, preludes } = await loadPreludes($).catch(() => ({ projectDir: null, preludes: [] }))
 
     const ledger: Entry[] = []
     let isClosed = false
@@ -291,9 +391,14 @@ export const register: Register = on => {
     let tools: { name: string; description: string }[] | undefined
     const toolList = async () => (tools ??= (await $.tool.list()).filter(t => t.name !== TOOL))
 
-    const callTool = async (tool: string, input: Record<string, unknown>, quiet = false): Promise<Reply> => {
+    const callTool = async (
+      tool: string,
+      input: Record<string, unknown>,
+      { quiet = false, soft = false, label }: Pick<Call, 'quiet' | 'soft' | 'label'> = {},
+    ): Promise<Reply> => {
       if (tool === TOOL) return { deny: 'codemode cannot call itself.' }
-      const entry: Entry = { tool, arg: brief(input), state: 'running' }
+      const arg = typeof label === 'string' && label.trim() ? oneLine(label, 60) : brief(input)
+      const entry: Entry = { tool, arg, state: 'running' }
       ledger.push(entry)
       showStatus()
       if (ledger.length > MAX_CALLS) {
@@ -312,6 +417,18 @@ export const register: Register = on => {
         if (quiet && r.isError === true && /exceeds maximum allowed (size|tokens)/.test(r.text ?? '')) {
           ledger.splice(ledger.indexOf(entry), 1)
           return { text: r.text ?? '', result: r.result, isError: true }
+        }
+        const exit = soft && r.isError === true ? softExit(r.text ?? '') : undefined
+        if (exit !== undefined) {
+          entry.state = 'ok'
+          entry.exit = exit
+          return { text: r.text ?? '', result: r.result, isError: true }
+        }
+        const timedOutAfterMs = (r.result as { timedOutAfterMs?: unknown } | undefined)?.timedOutAfterMs
+        if (soft && typeof timedOutAfterMs === 'number') {
+          entry.state = 'failed'
+          entry.note = `timed out after ${timedOutAfterMs / 1000} s; Bash moved it to the background`
+          return { text: r.text ?? '', result: r.result, isError: false }
         }
         entry.state = r.isError === true ? 'failed' : 'ok'
         if (r.isError === true) entry.note = r.text
@@ -393,10 +510,12 @@ export const register: Register = on => {
       return { isError: true, text: `Unknown codemode request ${tool}.` }
     }
 
-    const serve = async ({ id, tool, input, quiet }: Call) => {
+    const serve = async ({ id, tool, input, quiet, soft, label }: Call) => {
       let reply: Reply
       try {
-        reply = tool.startsWith('$') ? await serveOwn(tool, input ?? {}) : await callTool(tool, input ?? {}, quiet === true)
+        reply = tool.startsWith('$')
+          ? await serveOwn(tool, input ?? {})
+          : await callTool(tool, input ?? {}, { quiet: quiet === true, soft: soft === true, label })
       } catch (err) {
         reply = { isError: true, text: err instanceof Error ? err.message : String(err) }
       }
@@ -437,7 +556,7 @@ export const register: Register = on => {
           '--allow-worker', '--preserve-symlinks-main', '--no-warnings',
           guestPath, runDir, String(timeoutS),
         ],
-        input: program,
+        input: JSON.stringify({ program, preludes, projectDir }),
       })
       let buffer = ''
       let isOverflow = false
