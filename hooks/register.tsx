@@ -22,8 +22,16 @@ const GUEST_PATH = 'PATH=/usr/local/bin:/usr/bin:/bin'
 // timeout or kill still fails.
 const EXIT = /^Exit code (-?\d+)/
 const BASH_KILLED = /Command timed out after |Command killed: /
-const PRELUDE_FILE = /^(?!.*\.d\.ts$).+\.(js|ts)$/
-const DOC_LINE = /^\/\/: (.*?)\r?$/
+// The prelude files and their doc lines, per language.
+const PRELUDE = {
+  js: { file: /^(?!.*\.d\.ts$).+\.(js|ts)$/, doc: /^\/\/: (.*?)\r?$/ },
+  py: { file: /^.+\.py$/, doc: /^#: (.*?)\r?$/ },
+} as const
+type Lang = keyof typeof PRELUDE
+// CODEMODE_LANG=python (or py) selects the Python runtime for the session.
+const langOf = (value: string | undefined): Lang => (/^(python|py)$/i.test(value?.trim() ?? '') ? 'py' : 'js')
+// The Python sandbox binds these root links of the host, or the dirs themselves.
+const ROOT_LINKS = ['/bin', '/sbin', '/lib', '/lib64']
 
 // The nudge on serial read-only calls outside exec (see the tool.call hook).
 const PROBE_TOOLS = new Set(['Bash', 'Grep', 'Glob'])
@@ -59,6 +67,8 @@ const EXPANDED = { plugin: 'codemode', key: 'expanded' } as const
 // (CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH), so tool.describe puts the full
 // text back.
 const MAX_DESCRIPTION = 4000
+const REPAIR_LINE =
+  'codemode repairs near-miss tool names and input keys (read to Read, path to file_path), and the ledger lists each repair.'
 const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value, console lines and a call ledger come back.
 
 Use it for every read-only probe (rg, ssh, sed, cat, Mongo, reads of files you will not edit) when another probe may follow, even if this one is a single call. Before the first probe, list what you need to know, then fetch every independent part in one exec. Use plain Bash only for writes and for jobs over about a minute (run_in_background).
@@ -79,6 +89,8 @@ Globals:
 
 Bash output: stdout with stderr merged, cut at 30000 chars (sh and ssh give saved, the full-output path). A failed call keeps 10000 chars. With run_in_background, Bash returns the task id at once.
 
+${REPAIR_LINE}
+
 Prelude: each exec first runs ~/.claude/codemode/prelude/*.{js,ts}, then <projectDir>/.codemode/prelude/*.{js,ts}. Their top-level declarations are globals. A prelude that throws is skipped with a note.
 
 timeoutSeconds (default 120, max 600) counts program time only, not tool waits. 8 calls run at once, 300 per run.
@@ -87,6 +99,41 @@ Example:
 const [hits, disk] = await Promise.all([sh\`rg -n -i \${"needle"} src\`, ssh("buildhost", "df -h /")])
 return { hits: hits.ok ? hits.out : \`exit \${hits.code}\`, disk: disk.out }`
 
+const DESCRIPTION_PY = `Run a Python program that calls Claude Code tools. Only its return value, printed lines and a call ledger come back.
+
+Use it for every read-only probe (rg, ssh, sed, cat, Mongo, reads of files you will not edit) when another probe may follow, even if this one is a single call. Before the first probe, list what you need to know, then fetch every independent part in one exec. Use plain Bash only for writes and for jobs over about a minute (run_in_background).
+
+The program is the body of an async function: use await and return. Strings come back as is, other values as JSON, long multi-line strings as raw sections. A sandbox blocks network and host files: all I/O goes through tools, under the normal permissions. asyncio, json and re are preloaded.
+
+Globals (await all but q and helpers):
+- sh(cmd, **opts): {ok, code, out, saved?}. A non-zero exit is data, so one empty grep does not stop a batch (no match: code 1, meaning "No matches found"). A deny or Bash timeout raises. Quote values with q(). opts go to Bash (timeout ms, description).
+- ssh(host, script, timeout=90): {ok, code, out, host, timedOut}. The script goes to remote bash on stdin: no extra quoting. Give stdin readers </dev/null. Auto mode may deny an inline script with \${...} next to quotes: keep such a script in a file. Exit 255: ssh failed.
+- bash(cmd, **opts): stdout. A non-zero exit raises ToolError.
+- read(path, offset=None, limit=None): content without line numbers. Big files are paged up to about 48k tokens; a cut read ends with a "[codemode: read stopped at line N ...]" line.
+- tools.Name(input=None, **kw): the tool's text; raises ToolError. call(name, input=None, **kw): {text, result, isError, deny}; never raises.
+- q(*words): POSIX single-quoted words; lists give one word per item.
+- list_tools(filter=None), describe(name): tool names and full descriptions.
+- store.get/set/delete/keys: JSON kept across execs in this session (256 keys, 1 MB each). Bash cannot see it.
+- helpers(): doc lines of the loaded prelude files. project_dir: launch dir, or the nearest one above it with .codemode.
+- print, ToolError (.tool, .text). Results are dicts that also read keys as attributes: r.out is r["out"].
+
+Bash output: stdout with stderr merged, cut at 30000 chars (sh and ssh give saved, the full-output path). A failed call keeps 10000 chars. With run_in_background, Bash returns the task id at once.
+
+${REPAIR_LINE}
+
+Prelude: each exec first runs ~/.claude/codemode/prelude/*.py, then <projectDir>/.codemode/prelude/*.py. Their top-level names are globals. A prelude that raises is skipped with a note.
+
+timeoutSeconds (default 120, max 600) counts program time only, not tool waits. 8 calls run at once, 300 per run.
+
+Example:
+hits, disk = await asyncio.gather(sh(f"rg -n -i {q('needle')} src"), ssh("buildhost", "df -h /"))
+return {"hits": hits.out if hits.ok else f"exit {hits.code}", "disk": disk.out}`
+
+const PROGRAM_PARAM: Record<Lang, string> = {
+  js: 'Body of an async function. Use await and return.',
+  py: 'Body of an async Python function. Use await and return.',
+}
+
 // quiet: a read() page. When it fails on Read's size or token cap, read() pages
 // around it, so it leaves no ledger entry. soft: an sh() or ssh() call.
 // label: the ledger argument in place of the command head.
@@ -94,7 +141,8 @@ type Call = {
   type: 'call'
   id: number
   tool: string
-  input: Record<string, unknown>
+  // A plain string fills the tool's primary key (see PRIMARY).
+  input: Record<string, unknown> | string
   quiet?: boolean
   soft?: boolean
   label?: string
@@ -110,8 +158,16 @@ type Done = {
   programSeconds?: number
 }
 type Reply = { text?: string; result?: unknown; isError?: boolean; deny?: string }
-// exit: a soft call's non-zero exit code. Its state is ok.
-type Entry = { tool: string; arg: string; state: 'running' | 'ok' | 'failed' | 'denied'; note?: string; exit?: number }
+// exit: a soft call's non-zero exit code. Its state is ok. repairs: the
+// name and key fixes the call got (see the tool repair section).
+type Entry = {
+  tool: string
+  arg: string
+  state: 'running' | 'ok' | 'failed' | 'denied'
+  note?: string
+  exit?: number
+  repairs?: string[]
+}
 type Prelude = { path: string; source?: string; error?: string }
 
 const oneLine = (text: string, max: number) => {
@@ -176,7 +232,7 @@ const distance = (a: string, b: string) => {
   return row[b.length] ?? 0
 }
 
-const unknownTool = (name: string, names: string[]) => {
+const unknownTool = (name: string, names: string[], lang: Lang) => {
   const want = name.toLowerCase()
   const close = names
     .map(n => ({ n, d: distance(want, n.toLowerCase()) }))
@@ -185,7 +241,7 @@ const unknownTool = (name: string, names: string[]) => {
     .slice(0, 3)
     .map(x => x.n)
   const hint = close.length ? ` Close names: ${close.join(', ')}.` : ''
-  return `No tool named "${name}" in this session.${hint} listTools() lists them all.`
+  return `No tool named "${name}" in this session.${hint} ${lang === 'py' ? 'list_tools()' : 'listTools()'} lists them all.`
 }
 
 const tally = (entries: Entry[]) => {
@@ -215,7 +271,231 @@ const ledgerLine = (ledger: Entry[]) => {
   }
   const nonzero = ledger.filter(c => c.exit !== undefined).length
   const exits = nonzero ? `; nonzero exits: ${nonzero}` : ''
-  return `calls: ${ledger.length} (${tally(ledger)})${exits}; failed: ${group('failed')}; denied: ${group('denied')}`
+  const fixes = new Map<string, number>()
+  for (const c of ledger) for (const fix of c.repairs ?? []) fixes.set(fix, (fixes.get(fix) ?? 0) + 1)
+  const repaired = fixes.size
+    ? `; repaired: ${oneLine([...fixes].map(([fix, n]) => (n > 1 ? `${fix} x${n}` : fix)).join(', '), 200)}`
+    : ''
+  return `calls: ${ledger.length} (${tally(ledger)})${exits}; failed: ${group('failed')}; denied: ${group('denied')}${repaired}`
+}
+
+// Tool repair. A near-miss tool name or input key gets its canonical form
+// before the call, or once after an InputValidationError. The canonical key
+// always wins: a repair never overwrites a key that is present.
+
+type KeyType = 'string' | 'number' | 'boolean' | 'other'
+// The input keys of the built-in tools, from BuiltinToolInputs. Grep and Glob
+// are not in it; their keys are the ones of Claude Code's own Grep and Glob.
+const KEYS: Record<string, Record<string, KeyType>> = {
+  Read: { file_path: 'string', offset: 'number', limit: 'number', pages: 'string' },
+  Write: { file_path: 'string', content: 'string' },
+  Edit: { file_path: 'string', old_string: 'string', new_string: 'string', replace_all: 'boolean' },
+  Bash: {
+    command: 'string',
+    timeout: 'number',
+    description: 'string',
+    run_in_background: 'boolean',
+    dangerouslyDisableSandbox: 'boolean',
+  },
+  Grep: {
+    pattern: 'string',
+    path: 'string',
+    glob: 'string',
+    output_mode: 'string',
+    '-B': 'number',
+    '-A': 'number',
+    '-C': 'number',
+    context: 'number',
+    '-n': 'boolean',
+    '-i': 'boolean',
+    type: 'string',
+    head_limit: 'number',
+    offset: 'number',
+    multiline: 'boolean',
+  },
+  Glob: { pattern: 'string', path: 'string' },
+  WebFetch: { url: 'string', prompt: 'string' },
+  WebSearch: { query: 'string', allowed_domains: 'other', blocked_domains: 'other' },
+  NotebookEdit: {
+    notebook_path: 'string',
+    cell_id: 'string',
+    new_source: 'string',
+    cell_type: 'string',
+    edit_mode: 'string',
+  },
+  ToolSearch: { query: 'string', max_results: 'number' },
+}
+const FILE_KEYS = { path: 'file_path', file: 'file_path', filename: 'file_path' }
+const DIR_KEYS = { dir: 'path', directory: 'path' }
+// Key aliases per built-in. Each target is a key of KEYS.
+const KEY_ALIASES: Record<string, Record<string, string>> = {
+  Read: FILE_KEYS,
+  Write: { ...FILE_KEYS, text: 'content', contents: 'content' },
+  Edit: {
+    ...FILE_KEYS,
+    old: 'old_string',
+    oldText: 'old_string',
+    old_text: 'old_string',
+    old_str: 'old_string',
+    new: 'new_string',
+    newText: 'new_string',
+    new_text: 'new_string',
+    new_str: 'new_string',
+  },
+  NotebookEdit: { path: 'notebook_path', notebook: 'notebook_path' },
+  Bash: { cmd: 'command', script: 'command' },
+  Grep: { regex: 'pattern', ignore_case: '-i', case_insensitive: '-i', ...DIR_KEYS },
+  Glob: { glob: 'pattern', ...DIR_KEYS },
+  WebFetch: { link: 'url' },
+  WebSearch: { q: 'query' },
+}
+// The key a plain string input fills.
+const PRIMARY: Record<string, string> = {
+  Read: 'file_path',
+  Bash: 'command',
+  Grep: 'pattern',
+  Glob: 'pattern',
+  WebFetch: 'url',
+  WebSearch: 'query',
+  ToolSearch: 'query',
+}
+// Tool name aliases by squashed name. Each applies only when its tool is in the session.
+const TOOL_ALIASES: Record<string, string> = {
+  shell: 'Bash',
+  readfile: 'Read',
+  writefile: 'Write',
+  editfile: 'Edit',
+  search: 'Grep',
+  fetch: 'WebFetch',
+}
+
+const own = <T,>(table: Record<string, T>, key: string) => (Object.hasOwn(table, key) ? table[key] : undefined)
+const squash = (name: string) => name.toLowerCase().replace(/[-_.\s]/g, '')
+const snake = (key: string) =>
+  key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase()
+
+// The one session tool a near-miss name means. Zero or several matches give undefined.
+const resolveTool = (name: string, names: string[]) => {
+  const want = squash(name)
+  const hits = names.filter(n => n !== TOOL && squash(n) === want)
+  if (hits.length) return hits.length === 1 ? hits[0] : undefined
+  const alias = own(TOOL_ALIASES, want)
+  return alias !== undefined && names.includes(alias) ? alias : undefined
+}
+
+// A string that turns into a number or boolean without loss, else undefined.
+const coerce = (type: KeyType | string | undefined, value: unknown) => {
+  if (typeof value !== 'string') return undefined
+  if (type === 'number' && /^-?\d+(?:\.\d+)?$/.test(value.trim())) return Number(value)
+  if (type === 'boolean' && (value === 'true' || value === 'false')) return value === 'true'
+  return undefined
+}
+
+type Repair = { input: Record<string, unknown>; repairs: string[]; renames: [string, string][] }
+
+const renameKey = (tool: string, input: Record<string, unknown>, from: string, to: string, repairs: string[]) => {
+  if (from === to || !Object.hasOwn(input, from) || Object.hasOwn(input, to)) return false
+  input[to] = input[from]
+  delete input[from]
+  repairs.push(`${tool} ${from}→${to}`)
+  return true
+}
+
+// The fixes before a call: the renames learned in this session, then for a
+// built-in the key aliases, null drops and number or boolean strings.
+const repairBefore = (tool: string, input: Record<string, unknown>, learned?: Map<string, string>) => {
+  const out = { ...input }
+  const repairs: string[] = []
+  for (const [from, to] of learned ?? []) renameKey(tool, out, from, to, repairs)
+  const keys = own(KEYS, tool)
+  if (!keys) return { input: out, repairs }
+  const aliases = own(KEY_ALIASES, tool) ?? {}
+  for (const key of Object.keys(out)) {
+    if (Object.hasOwn(keys, key)) continue
+    const target = Object.hasOwn(keys, snake(key)) ? snake(key) : own(aliases, key)
+    if (target !== undefined && Object.hasOwn(keys, target)) renameKey(tool, out, key, target, repairs)
+  }
+  for (const [key, value] of Object.entries(out)) {
+    if (value === null) {
+      delete out[key]
+      repairs.push(`${tool} ${key}:null dropped`)
+      continue
+    }
+    const fixed = coerce(own(keys, key), value)
+    if (fixed !== undefined) {
+      out[key] = fixed
+      repairs.push(`${tool} ${key}→${typeof fixed}`)
+    }
+  }
+  return { input: out, repairs }
+}
+
+type Issue = { code?: string; path?: unknown[]; message?: string; keys?: unknown[]; expected?: string }
+
+// The issues of an InputValidationError: the zod list in result, else the
+// readable lines of text. Undefined for any other result.
+const validationIssues = (r: { result?: unknown; text?: string }): Issue[] | undefined => {
+  const zod = typeof r.result === 'string' ? /^InputValidationError: (\[[\s\S]*\])\s*$/.exec(r.result)?.[1] : undefined
+  if (zod !== undefined) {
+    try {
+      const issues: unknown = JSON.parse(zod)
+      if (Array.isArray(issues)) return issues as Issue[]
+    } catch {}
+  }
+  const text = r.text ?? ''
+  if (!text.includes('InputValidationError')) return undefined
+  const issues: Issue[] = []
+  for (const m of text.matchAll(/An unexpected parameter `([^`]+)` was provided/g)) {
+    issues.push({ code: 'unrecognized_keys', path: [], keys: [m[1]] })
+  }
+  for (const m of text.matchAll(/The required parameter `([^`]+)` is missing/g)) {
+    issues.push({ code: 'invalid_type', path: [m[1]], message: 'received undefined' })
+  }
+  for (const m of text.matchAll(/The parameter `([^`]+)` type is expected as `(\w+)` but provided as `(\w+)`/g)) {
+    issues.push({ code: 'invalid_type', path: [m[1]], expected: m[2], message: `received ${m[3]}` })
+  }
+  return issues
+}
+
+// One fix for all the issues of a failed validation: a single unknown key
+// renamed to a single missing key, a lossless number or boolean string
+// coerced, a null dropped. Undefined when an issue has no fix.
+const repairAfter = (tool: string, input: Record<string, unknown>, issues: Issue[]): Repair | undefined => {
+  const out = { ...input }
+  const repairs: string[] = []
+  const unknown: string[] = []
+  const missing: string[] = []
+  for (const issue of issues) {
+    const path = Array.isArray(issue.path) ? issue.path : []
+    if (issue.code === 'unrecognized_keys' && path.length === 0) {
+      unknown.push(...(issue.keys ?? []).map(String))
+      continue
+    }
+    if (issue.code !== 'invalid_type' || path.length !== 1) return undefined
+    const key = String(path[0])
+    const received = /received (\w+)/.exec(issue.message ?? '')?.[1]
+    if (received === 'undefined') missing.push(key)
+    else if (received === 'null' && out[key] === null) {
+      delete out[key]
+      repairs.push(`${tool} ${key}:null dropped`)
+    } else {
+      const fixed = received === 'string' ? coerce(issue.expected, out[key]) : undefined
+      if (fixed === undefined) return undefined
+      out[key] = fixed
+      repairs.push(`${tool} ${key}→${typeof fixed}`)
+    }
+  }
+  const renames: [string, string][] = []
+  if (unknown.length || missing.length) {
+    const [from, to] = [unknown[0], missing[0]]
+    if (unknown.length !== 1 || missing.length !== 1 || from === undefined || to === undefined) return undefined
+    if (!renameKey(tool, out, from, to, repairs)) return undefined
+    renames.push([from, to])
+  }
+  return repairs.length ? { input: out, repairs, renames } : undefined
 }
 
 // The exit code of a soft call that ended in a plain non-zero exit.
@@ -254,11 +534,11 @@ const findProject = async ($: Host, root: string, home: string | undefined) => {
   return root
 }
 
-// The .js and .ts files of one prelude dir, sorted by name.
-const preludeDir = async ($: Host, dir: string): Promise<Prelude[]> => {
+// The prelude files of one dir for the language, sorted by name.
+const preludeDir = async ($: Host, dir: string, lang: Lang): Promise<Prelude[]> => {
   const entries = await $.fs.list(dir).catch(() => [])
   const names = entries
-    .filter(f => (f.kind === 'file' || f.isLink) && PRELUDE_FILE.test(f.name))
+    .filter(f => (f.kind === 'file' || f.isLink) && PRELUDE[lang].file.test(f.name))
     .map(f => f.name)
     .sort()
   return Promise.all(
@@ -274,22 +554,22 @@ const preludeDir = async ($: Host, dir: string): Promise<Prelude[]> => {
 }
 
 // The global prelude files, then the project's. Read again on every exec.
-const loadPreludes = async ($: Host, fallbackRoot?: string) => {
+const loadPreludes = async ($: Host, lang: Lang, fallbackRoot?: string) => {
   const home = await $.env.get('HOME')
   const root = (await $.session.root().catch(() => undefined)) ?? fallbackRoot
   const projectDir = root === undefined ? null : await findProject($, root, home)
   const preludes = [
-    ...(home ? await preludeDir($, `${home}/.claude/codemode/prelude`) : []),
-    ...(projectDir ? await preludeDir($, `${projectDir}/.codemode/prelude`) : []),
+    ...(home ? await preludeDir($, `${home}/.claude/codemode/prelude`, lang) : []),
+    ...(projectDir ? await preludeDir($, `${projectDir}/.codemode/prelude`, lang) : []),
   ]
   return { projectDir, preludes }
 }
 
-// The description's helper block: the helper signatures from the "//: " doc
-// lines at session start. helpers() gives the full lines.
-const helperDocs = (preludes: Prelude[], room: number) => {
+// The description's helper block: the helper signatures from the doc lines
+// ("//: " in JS, "#: " in Python) at session start. helpers() gives the full lines.
+const helperDocs = (preludes: Prelude[], lang: Lang, room: number) => {
   const names = preludes
-    .flatMap(p => (p.source ?? '').split('\n').flatMap(l => DOC_LINE.exec(l)?.[1] ?? []))
+    .flatMap(p => (p.source ?? '').split('\n').flatMap(l => PRELUDE[lang].doc.exec(l)?.[1] ?? []))
     .map(line => /^[^:]*?\)/.exec(line)?.[0] ?? line.split(':')[0] ?? line)
   if (!names.length) return ''
   let text = 'Prelude helpers (helpers() gives their docs; edits after session start reach the runtime only):'
@@ -301,9 +581,55 @@ const helperDocs = (preludes: Prelude[], room: number) => {
   return text
 }
 
+// The Python sandbox: CPython under bwrap, with no network, no host files
+// but /usr, the run dir and guest.py, and an empty environment. It fails
+// closed: without bwrap or a python3 under /usr, the answer is an error text.
+type Box = { bwrap: string; python: string; guest: string; roots: string[] }
+const pythonBox = async ($: Pick<EngineInterface, 'process' | 'fs' | 'plugin'>): Promise<Box | string> => {
+  const which = async (bin: string) =>
+    (await $.process.run(['sh', '-c', `command -v ${bin}`]).catch(() => undefined))?.stdout.trim() || undefined
+  const bwrap = await which('bwrap')
+  if (!bwrap?.startsWith('/')) {
+    return 'Python mode needs bwrap (bubblewrap) to sandbox the program. No bwrap is on PATH, so the program did not run.'
+  }
+  const found = await which('python3')
+  const python = found && (await $.fs.stat(found, { resolve: true }).catch(() => undefined))?.realPath
+  if (!python) return 'Python mode needs python3. No python3 is on PATH, so the program did not run.'
+  if (!python.startsWith('/usr/')) {
+    return `Python mode runs only a python3 under /usr, because the sandbox binds /usr alone. python3 is ${python}, so the program did not run.`
+  }
+  const guest = `${$.plugin.root}/runtime/guest.py`
+  const real = (await $.fs.stat(guest, { resolve: true }).catch(() => undefined))?.realPath ?? guest
+  const roots: string[] = []
+  for (const dir of ROOT_LINKS) {
+    const stat = await $.fs.stat(dir, { resolve: true }).catch(() => undefined)
+    if (stat?.isLink && stat.realPath) roots.push('--symlink', stat.realPath, dir)
+    else roots.push('--ro-bind-try', dir, dir)
+  }
+  return { bwrap, python, guest: real, roots }
+}
+
+const pythonArgv = (box: Box, runDir: string, timeoutS: number) => [
+  box.bwrap,
+  '--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
+  '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', 'C.UTF-8',
+  '--ro-bind', '/usr', '/usr', ...box.roots,
+  '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+  '--ro-bind-try', '/etc/localtime', '/etc/localtime',
+  '--ro-bind', runDir, runDir, '--ro-bind', box.guest, box.guest,
+  box.python, '-I', '-B', box.guest, runDir, String(timeoutS),
+]
+
 export const register: Register = on => {
   let nodePath: string | undefined
   let guestPath: string | undefined
+  let box: Box | undefined
+  // The language of this session, read once at session start. A hot reload
+  // does not run session.start again, so it falls back to JS.
+  let lang: Lang = 'js'
+  // Key renames that passed validation after a failed call, by tool, for
+  // the rest of the session.
+  const learned = new Map<string, Map<string, string>>()
   // The descriptions already saved to state, so a repeat describe writes nothing.
   const seen = new Map<string, string>()
   // The exec description as registered, before the MCP client cuts it.
@@ -311,17 +637,20 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    const { preludes } = await loadPreludes($, e.cwd).catch(() => ({ preludes: [] }))
-    const docs = helperDocs(preludes, MAX_DESCRIPTION - DESCRIPTION.length - 2)
-    const description = docs ? `${DESCRIPTION}\n\n${docs}` : DESCRIPTION
-    execDescription = description.length <= MAX_DESCRIPTION ? description : DESCRIPTION
+    lang = langOf(await $.env.get('CODEMODE_LANG').catch(() => undefined))
+    learned.clear()
+    const base = lang === 'py' ? DESCRIPTION_PY : DESCRIPTION
+    const { preludes } = await loadPreludes($, lang, e.cwd).catch(() => ({ preludes: [] }))
+    const docs = helperDocs(preludes, lang, MAX_DESCRIPTION - base.length - 2)
+    const description = docs ? `${base}\n\n${docs}` : base
+    execDescription = description.length <= MAX_DESCRIPTION ? description : base
     await $.tool.register({
       name: 'exec',
       description: execDescription,
       inputSchema: {
         type: 'object',
         properties: {
-          program: { type: 'string', description: 'Body of an async function. Use await and return.' },
+          program: { type: 'string', description: PROGRAM_PARAM[lang] },
           timeoutSeconds: {
             type: 'number',
             description: `Program-time limit in seconds. Waiting on tools does not count. Default ${DEFAULT_TIMEOUT_S}, max ${MAX_TIMEOUT_S}.`,
@@ -410,14 +739,26 @@ export const register: Register = on => {
     const sessionId = await $.session.id()
     const runRef = { ...RUNS, id: e.tool_use_id }
     const startedAt = await $.clock.now()
+    // One run keeps the language it started with.
+    const runLang = lang
+    const isPy = runLang === 'py'
 
-    nodePath ??= (await $.process.run(['sh', '-c', 'command -v node'])).stdout.trim() || 'node'
-    if (guestPath === undefined) {
-      const guest = `${$.plugin.root}/runtime/guest.mjs`
-      guestPath = (await $.fs.stat(guest, { resolve: true })).realPath ?? guest
+    if (isPy) {
+      const found = box ?? (await pythonBox($))
+      if (typeof found === 'string') return { result: `Error: ${found}`, isError: true as const }
+      box = found
+    } else {
+      nodePath ??= (await $.process.run(['sh', '-c', 'command -v node'])).stdout.trim() || 'node'
+      if (guestPath === undefined) {
+        const guest = `${$.plugin.root}/runtime/guest.mjs`
+        guestPath = (await $.fs.stat(guest, { resolve: true })).realPath ?? guest
+      }
     }
     const runDir = (await $.process.run(['mktemp', '-d', '-t', 'codemode.XXXXXX'])).stdout.trim()
-    const { projectDir, preludes } = await loadPreludes($).catch(() => ({ projectDir: null, preludes: [] }))
+    const { projectDir, preludes } = await loadPreludes($, runLang).catch(() => ({
+      projectDir: null,
+      preludes: [],
+    }))
 
     const ledger: Entry[] = []
     let isClosed = false
@@ -455,14 +796,48 @@ export const register: Register = on => {
     let tools: { name: string; description: string }[] | undefined
     const toolList = async () => (tools ??= (await $.tool.list()).filter(t => t.name !== TOOL))
 
+    // The engine throws for a tool it does not know.
+    const attempt = async (name: string, input: Record<string, unknown>) => {
+      try {
+        return { r: await $.tool.call({ ...input, tool: name } as never) }
+      } catch (err) {
+        return { err }
+      }
+    }
+    const learn = (name: string, renames: [string, string][]) => {
+      if (!renames.length) return
+      const known = learned.get(name) ?? new Map<string, string>()
+      for (const [from, to] of renames) known.set(from, to)
+      learned.set(name, known)
+    }
+
     const callTool = async (
       tool: string,
-      input: Record<string, unknown>,
+      raw: Record<string, unknown> | string,
       { quiet = false, soft = false, label }: Pick<Call, 'quiet' | 'soft' | 'label'> = {},
     ): Promise<Reply> => {
       if (tool === TOOL) return { deny: 'codemode cannot call itself.' }
-      const arg = typeof label === 'string' && label.trim() ? oneLine(label, 60) : brief(input)
-      const entry: Entry = { tool, arg, state: 'running' }
+      let name = tool
+      const repairs: string[] = []
+      let input: Record<string, unknown>
+      if (typeof raw === 'string') {
+        // A string fills the primary key of the tool, so a near-miss name
+        // has to resolve first.
+        if (own(PRIMARY, name) === undefined) {
+          const fixed = resolveTool(name, (await toolList().catch(() => [])).map(t => t.name))
+          if (fixed !== undefined && fixed !== name) {
+            repairs.push(`${name}→${fixed}`)
+            name = fixed
+          }
+        }
+        const key = own(PRIMARY, name)
+        if (key === undefined) return { isError: true, text: `The input of ${tool} must be an object of its parameters.` }
+        input = { [key]: raw }
+        repairs.push(`${name} string→${key}`)
+      } else input = raw
+      let sent = repairBefore(name, input, learned.get(name))
+      const arg = typeof label === 'string' && label.trim() ? oneLine(label, 60) : brief(sent.input)
+      const entry: Entry = { tool: name, arg, state: 'running', repairs }
       ledger.push(entry)
       showStatus()
       if (ledger.length > MAX_CALLS) {
@@ -472,7 +847,37 @@ export const register: Register = on => {
       }
       await acquire()
       try {
-        const r = await $.tool.call({ ...input, tool } as never)
+        let out = await attempt(name, sent.input)
+        if ('err' in out) {
+          // Names resolve lazily, so a call by the right name costs no list call.
+          const names = (await toolList().catch(() => [])).map(t => t.name)
+          if (names.includes(name)) throw out.err
+          const fixed = resolveTool(name, names)
+          if (fixed === undefined) {
+            entry.state = 'failed'
+            entry.note = 'no such tool'
+            return { isError: true, text: unknownTool(name, names, runLang) }
+          }
+          repairs.push(`${name}→${fixed}`)
+          name = fixed
+          entry.tool = fixed
+          sent = repairBefore(name, input, learned.get(name))
+          out = await attempt(name, sent.input)
+          if ('err' in out) throw out.err
+        }
+        repairs.push(...sent.repairs)
+        let r = out.r
+        // Validation fails before the tool runs, so one retry repeats no side effect.
+        const issues = r.isError === true ? validationIssues(r) : undefined
+        const fix = issues && repairAfter(name, sent.input, issues)
+        if (fix) {
+          const again = await attempt(name, fix.input)
+          if (again.r !== undefined && !(again.r.isError === true && validationIssues(again.r))) {
+            r = again.r
+            repairs.push(...fix.repairs)
+            learn(name, fix.renames)
+          }
+        }
         if (r.deny !== undefined) {
           entry.state = 'denied'
           entry.note = r.deny
@@ -499,10 +904,8 @@ export const register: Register = on => {
         return { text: r.text ?? '', result: r.result, isError: r.isError === true }
       } catch (err) {
         entry.state = 'failed'
-        const names = (await toolList().catch(() => [])).map(t => t.name)
-        const isKnown = names.includes(tool)
-        const text = isKnown ? (err instanceof Error ? err.message : String(err)) : unknownTool(tool, names)
-        entry.note = isKnown ? text : 'no such tool'
+        const text = err instanceof Error ? err.message : String(err)
+        entry.note = text
         return { isError: true, text }
       } finally {
         release()
@@ -568,7 +971,7 @@ export const register: Register = on => {
           const full = await $.state.get({ ...DESCRIPTIONS, id: found.name }).catch(() => undefined)
           return { text: full?.value ?? found.description }
         }
-        return { isError: true, text: unknownTool(String(input.name), list.map(t => t.name)) }
+        return { isError: true, text: unknownTool(String(input.name), list.map(t => t.name), runLang) }
       }
       if (tool === '$store') return storeOp(input)
       return { isError: true, text: `Unknown codemode request ${tool}.` }
@@ -578,7 +981,7 @@ export const register: Register = on => {
       let reply: Reply
       try {
         reply = tool.startsWith('$')
-          ? await serveOwn(tool, input ?? {})
+          ? await serveOwn(tool, typeof input === 'object' && input !== null ? input : {})
           : await callTool(tool, input ?? {}, { quiet: quiet === true, soft: soft === true, label })
       } catch (err) {
         reply = { isError: true, text: err instanceof Error ? err.message : String(err) }
@@ -612,14 +1015,16 @@ export const register: Register = on => {
 
     showStatus()
     try {
+      const guest =
+        isPy && box
+          ? pythonArgv(box, runDir, timeoutS)
+          : [
+              nodePath ?? 'node', '--permission', `--allow-fs-read=${runDir}`, `--allow-fs-read=${guestPath}`,
+              '--allow-worker', '--preserve-symlinks-main', '--no-warnings',
+              guestPath ?? '', runDir, String(timeoutS),
+            ]
       const child = $.process.spawn({
-        argv: [
-          'env', '-i', GUEST_PATH,
-          'timeout', '-k', '2', String(CEILING_S),
-          nodePath, '--permission', `--allow-fs-read=${runDir}`, `--allow-fs-read=${guestPath}`,
-          '--allow-worker', '--preserve-symlinks-main', '--no-warnings',
-          guestPath, runDir, String(timeoutS),
-        ],
+        argv: ['env', '-i', GUEST_PATH, 'timeout', '-k', '2', String(CEILING_S), ...guest],
         input: JSON.stringify({ program, preludes, projectDir }),
       })
       let buffer = ''
@@ -666,7 +1071,9 @@ export const register: Register = on => {
     else if (done?.kind === 'timeout') {
       head = `Soft timeout: the program used ${done.programSeconds} s of program time, over its ${timeoutS} s limit, and was stopped. Time spent waiting on tools does not count. Raise timeoutSeconds (max ${MAX_TIMEOUT_S}) or do less per run.`
     } else if (done) head = `Program crashed: ${done.error}`
-    else if (exit?.code === 124 || exit?.code === 137) {
+    else if (isPy && stderr.trimStart().startsWith('bwrap:')) {
+      head = `Python sandbox error: bwrap did not start, so the program did not run. Python runs only inside the sandbox.\n${stderr.trim()}`
+    } else if (exit?.code === 124 || exit?.code === 137) {
       head = `Hard ceiling: the run passed ${CEILING_S} s of wall time and was killed.`
     } else {
       const how = exit ? `exit code ${exit.code}, signal ${exit.signal}` : 'no exit status'

@@ -168,7 +168,8 @@ function runProgram({ source, preludes, projectDir }) {
     if (typeof tool !== 'string') {
       return Promise.resolve({ isError: true, text: 'call(name, input) takes a tool name first.' })
     }
-    if (clean === null || typeof clean !== 'object' || Array.isArray(clean)) {
+    // A string goes to the host, which fills the tool's primary key with it.
+    if (typeof clean !== 'string' && (clean === null || typeof clean !== 'object' || Array.isArray(clean))) {
       return Promise.resolve({ isError: true, text: `The input of ${tool} must be an object of its parameters.` })
     }
     const id = ++seq
