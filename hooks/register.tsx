@@ -54,7 +54,10 @@ const RUNS = { plugin: 'codemode', key: 'runs' } as const
 const EXPANDED = { plugin: 'codemode', key: 'expanded' } as const
 
 // The host rejects a tool description over 4096 chars, and then the tool
-// does not exist in the session. Keep DESCRIPTION near 2900 chars.
+// does not exist in the session. Keep DESCRIPTION near 2900 chars. The MCP
+// client also cuts every listed description to 2048 chars
+// (CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH), so tool.describe puts the full
+// text back.
 const MAX_DESCRIPTION = 4000
 const DESCRIPTION = `Run a JavaScript or TypeScript program that calls Claude Code tools. Only its return value, console lines and a call ledger come back.
 
@@ -303,15 +306,18 @@ export const register: Register = on => {
   let guestPath: string | undefined
   // The descriptions already saved to state, so a repeat describe writes nothing.
   const seen = new Map<string, string>()
+  // The exec description as registered, before the MCP client cuts it.
+  let execDescription = DESCRIPTION
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     const { preludes } = await loadPreludes($, e.cwd).catch(() => ({ preludes: [] }))
     const docs = helperDocs(preludes, MAX_DESCRIPTION - DESCRIPTION.length - 2)
     const description = docs ? `${DESCRIPTION}\n\n${docs}` : DESCRIPTION
+    execDescription = description.length <= MAX_DESCRIPTION ? description : DESCRIPTION
     await $.tool.register({
       name: 'exec',
-      description: description.length <= MAX_DESCRIPTION ? description : DESCRIPTION,
+      description: execDescription,
       inputSchema: {
         type: 'object',
         properties: {
@@ -330,14 +336,15 @@ export const register: Register = on => {
 
   // $.tool.list() cuts descriptions short, so describe() serves the full
   // text the engine rendered. Every answer passes through unchanged, except
-  // that exec stays out of ToolSearch.
+  // exec: it gets its uncut description and stays out of ToolSearch.
   on('tool.describe', async ($, e, next) => {
-    const described = await next(e)
+    const engine = await next(e)
+    const described = e.tool === TOOL ? { description: execDescription, isDeferred: false } : engine
     if (seen.get(e.tool) !== described.description) {
       seen.set(e.tool, described.description)
       await $.state.set({ ...DESCRIPTIONS, id: e.tool }, described.description).catch(() => undefined)
     }
-    return e.tool === TOOL ? { description: described.description, isDeferred: false } : described
+    return described
   })
 
   // The nudge. A probe is a model call to Bash, Grep or Glob that core marks
