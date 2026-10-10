@@ -1,5 +1,5 @@
 import { update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { AgentSpawnArgs, AgentSpawnResult, EngineInterface, Register, TurnCompleteInput } from 'claude-code'
 
 import type { CodemodeJson, CodemodeRun } from '../types'
 
@@ -81,6 +81,7 @@ Globals:
 - bash(cmd, opts?): stdout. A non-zero exit throws ToolError.
 - read(path, { offset, limit }?): content without line numbers. Big files are paged up to about 48k tokens; a cut read ends with a "[codemode: read stopped at line N ...]" line.
 - tools.Name(input): the tool's text; throws ToolError. call(name, input): { text, result, isError, deny }; never throws.
+- agent(prompt, { type, model, description, name, cwd }?): the subagent's final answer. Throws ToolError on a deny or a failed agent. Agent waits take no call slot, so Promise.all fans out many.
 - q(...words): POSIX single-quoted words.
 - listTools(filter?), describe(name): tool names and full descriptions.
 - store.get/set/delete/keys: JSON kept across execs in this session (256 keys, 1 MB each). Bash cannot see it.
@@ -111,6 +112,7 @@ Globals (await all but q and helpers):
 - bash(cmd, **opts): stdout. A non-zero exit raises ToolError.
 - read(path, offset=None, limit=None): content without line numbers. Big files are paged up to about 48k tokens; a cut read ends with a "[codemode: read stopped at line N ...]" line.
 - tools.Name(input=None, **kw): the tool's text; raises ToolError. call(name, input=None, **kw): {text, result, isError, deny}; never raises.
+- agent(prompt, type="general-purpose", model=None, description=None, name=None, cwd=None): the subagent's final answer. Raises ToolError on a deny or a failed agent. Agent waits take no call slot, so asyncio.gather fans out many.
 - q(*words): POSIX single-quoted words; lists give one word per item.
 - list_tools(filter=None), describe(name): tool names and full descriptions.
 - store.get/set/delete/keys: JSON kept across execs in this session (256 keys, 1 MB each). Bash cannot see it.
@@ -358,6 +360,7 @@ const PRIMARY: Record<string, string> = {
   WebFetch: 'url',
   WebSearch: 'query',
   ToolSearch: 'query',
+  Agent: 'prompt',
 }
 // Tool name aliases by squashed name. Each applies only when its tool is in the session.
 const TOOL_ALIASES: Record<string, string> = {
@@ -503,6 +506,72 @@ const softExit = (text: string) => {
   const code = Number(EXIT.exec(text)?.[1])
   if (!Number.isInteger(code)) return undefined
   return (code === 143 || code === 137) && BASH_KILLED.test(text) ? undefined : code
+}
+
+// Agent calls. The host refuses the Agent tool through $.tool.call, so exec
+// spawns with $.agent.spawn. Its args take these Agent tool keys.
+const SPAWN_KEYS: Record<string, keyof AgentSpawnArgs> = {
+  prompt: 'prompt',
+  subagent_type: 'subagentType',
+  subagentType: 'subagentType',
+  description: 'description',
+  model: 'model',
+  name: 'name',
+  cwd: 'cwd',
+}
+
+// The spawn args of an Agent call, or the error text.
+const spawnArgs = (input: Record<string, unknown>): AgentSpawnArgs | string => {
+  const args: Partial<Record<keyof AgentSpawnArgs, string>> = {}
+  const unknown: string[] = []
+  for (const [key, value] of Object.entries(input)) {
+    if (value === null || value === undefined) continue
+    const to = own(SPAWN_KEYS, key)
+    if (to === undefined) unknown.push(key)
+    else if (typeof value !== 'string') return `The Agent parameter ${key} must be a string.`
+    else args[to] = value
+  }
+  if (unknown.length) {
+    return `Agent in exec takes prompt, subagent_type, description, model, name and cwd. It does not take ${unknown.join(', ')}.`
+  }
+  const prompt = args.prompt
+  if (!prompt?.trim()) return 'Agent needs a prompt.'
+  return { ...args, prompt, description: args.description ?? oneLine(prompt, 40) }
+}
+
+// The error text of an agent run that did not end in an answer.
+const agentFailure = (e: TurnCompleteInput) => {
+  const said = e.answer.trim() ? `\n${e.answer}` : ''
+  if (e.reason === 'refusal') {
+    const why = e.refusal.explanation ?? e.refusal.category
+    return `The agent refused${why ? `: ${why}` : '.'}${said}`
+  }
+  if (e.reason === 'aborted') return `The agent was stopped before it answered.${said}`
+  return `The agent ended on an API error.${said}`
+}
+
+// A spawned agent also delivers its answer to the main loop: a hand-back
+// (<agent-message from="ID">) and task notifications (<task-id>ID</task-id>).
+// The harness indents a hand-back's report, so only real frame lines start
+// at column zero.
+const DELIVERY_KINDS = new Set(['task-notification', 'peer', 'peer-send-message'])
+const DELIVERY_BLOCK =
+  /^<agent-message from="([^"]+)"[^>]*>\n[\s\S]*?^<\/agent-message>[ \t]*(?:\n|$)|^<task-notification>\n[\s\S]*?^<\/task-notification>[ \t]*(?:\n|$)/gm
+const TASK_ID = /<task-id>([^<]+)<\/task-id>/
+// An agent may notify more than once, so its id cannot leave the set on the
+// first block. The oldest ids go past this many.
+const ANSWERED_MAX = 512
+
+// The delivery text without the blocks of the given agents, and how many it lost.
+const withoutAgents = (text: string, ids: Set<string>) => {
+  let removed = 0
+  const rest = text.replace(DELIVERY_BLOCK, (block: string, from: string | undefined) => {
+    const id = from ?? TASK_ID.exec(block)?.[1]
+    if (id === undefined || !ids.has(id)) return block
+    removed += 1
+    return ''
+  })
+  return { rest, removed }
 }
 
 const progressNote = (ledger: Entry[]) => {
@@ -691,10 +760,6 @@ export const register: Register = on => {
     return loop
   }
   let isNudgeOn: boolean | undefined
-  on('prompt.submit', async ($, e, next) => {
-    loopOf(MAIN_LOOP).probes = 0
-    return next(e)
-  })
   on('tool.call', async ($, e, next) => {
     if (next.origin.plugin !== 'engine') return next(e)
     isNudgeOn ??= (await $.env.get('CODEMODE_NUDGE').catch(() => undefined)) !== '0'
@@ -727,6 +792,54 @@ export const register: Register = on => {
         ...keys.map(key => $.state.set({ ...STORE_VALUES, id: `${e.sessionId}/${key}` }, null)),
         $.state.set({ ...STORE_INDEX, id: e.sessionId }, []),
       ])
+    }
+    return next(e)
+  })
+
+  // $.agent.spawn resolves once the agent started. Its answer is the
+  // turn.complete of its loop, matched here by agentId. A turn that ends
+  // while a spawn is in flight waits in early, because that spawn has not
+  // given its agentId yet.
+  const waiting = new Map<string, (e: TurnCompleteInput) => void>()
+  const early = new Map<string, TurnCompleteInput>()
+  let spawning = 0
+  const finished = (agentId: string) =>
+    new Promise<TurnCompleteInput>(resolve => {
+      const ended = early.get(agentId)
+      if (ended === undefined) waiting.set(agentId, resolve)
+      else {
+        early.delete(agentId)
+        resolve(ended)
+      }
+    })
+  // The agents whose answer an exec program received. Their deliveries to
+  // the main loop would repeat it.
+  const answered = new Set<string>()
+  const markAnswered = (id: string) => {
+    answered.add(id)
+    for (const old of answered) {
+      if (answered.size <= ANSWERED_MAX) break
+      answered.delete(old)
+    }
+  }
+  // A prompt resets the probe count of the nudge. The engine allows one
+  // prompt.submit hook per module, so both jobs share it.
+  on('prompt.submit', async ($, e, next) => {
+    loopOf(MAIN_LOOP).probes = 0
+    if (!answered.size || !DELIVERY_KINDS.has(e.origin.kind)) return next(e)
+    const { rest, removed } = withoutAgents(e.text, answered)
+    if (!removed) return next(e)
+    if (!rest.trim()) return { drop: 'codemode: an exec program already received this agent answer.' }
+    return next({ ...e, text: rest })
+  })
+  on('turn.complete', async ($, e, next) => {
+    const id = e.agentId
+    if (id !== undefined) {
+      const resolve = waiting.get(id)
+      if (resolve) {
+        waiting.delete(id)
+        resolve(e)
+      } else if (spawning > 0) early.set(id, e)
     }
     return next(e)
   })
@@ -811,6 +924,50 @@ export const register: Register = on => {
       learned.set(name, known)
     }
 
+    // The agents of this run whose answer has not come yet. Agent calls take
+    // no call slot: Claude Code's own subagent limit governs them.
+    const spawned = new Set<string>()
+    const callAgent = async (entry: Entry, input: Record<string, unknown>): Promise<Reply> => {
+      const fail = (text: string): Reply => {
+        entry.state = 'failed'
+        entry.note = text
+        return { isError: true, text }
+      }
+      const args = spawnArgs(input)
+      if (typeof args === 'string') return fail(args)
+      // The exec's own loop is the parent. AgentSpawnArgs has no such key, and
+      // this release drops it (tested): an agent spawned from a subagent's
+      // exec gets no parentId and reports to the main loop.
+      const parent = e.agentId === undefined ? {} : { parentAgentId: e.agentId }
+      let started: AgentSpawnResult | undefined
+      let error: unknown
+      spawning += 1
+      try {
+        started = await $.agent.spawn({ ...args, ...parent } as AgentSpawnArgs)
+      } catch (err) {
+        error = err
+      }
+      spawning -= 1
+      const agentId = started?.agentId
+      const answer = agentId === undefined || isClosed ? undefined : finished(agentId)
+      if (spawning === 0) early.clear()
+      if (started === undefined) return fail(error instanceof Error ? error.message : String(error))
+      if (started.deny !== undefined) {
+        entry.state = 'denied'
+        entry.note = started.deny
+        return { deny: started.deny }
+      }
+      if (agentId === undefined) return fail('The spawn started no local agent, so no answer can come back.')
+      if (answer === undefined) return fail('The exec run ended before the spawn answered.')
+      spawned.add(agentId)
+      const ended = await answer
+      spawned.delete(agentId)
+      if (ended.reason !== 'answer') return fail(agentFailure(ended))
+      if (!isClosed) markAnswered(agentId)
+      entry.state = 'ok'
+      return { text: ended.answer, result: { agentId, model: started.model } }
+    }
+
     const callTool = async (
       tool: string,
       raw: Record<string, unknown> | string,
@@ -819,6 +976,10 @@ export const register: Register = on => {
       if (tool === TOOL) return { deny: 'codemode cannot call itself.' }
       let name = tool
       const repairs: string[] = []
+      if (name !== 'Agent' && squash(name) === 'agent') {
+        repairs.push(`${name}→Agent`)
+        name = 'Agent'
+      }
       let input: Record<string, unknown>
       if (typeof raw === 'string') {
         // A string fills the primary key of the tool, so a near-miss name
@@ -836,7 +997,12 @@ export const register: Register = on => {
         repairs.push(`${name} string→${key}`)
       } else input = raw
       let sent = repairBefore(name, input, learned.get(name))
-      const arg = typeof label === 'string' && label.trim() ? oneLine(label, 60) : brief(sent.input)
+      const arg =
+        typeof label === 'string' && label.trim()
+          ? oneLine(label, 60)
+          : name === 'Agent'
+            ? oneLine(String(sent.input.description ?? sent.input.prompt ?? ''), 60)
+            : brief(sent.input)
       const entry: Entry = { tool: name, arg, state: 'running', repairs }
       ledger.push(entry)
       showStatus()
@@ -844,6 +1010,14 @@ export const register: Register = on => {
         entry.state = 'denied'
         entry.note = 'call budget reached'
         return { deny: `codemode allows ${MAX_CALLS} tool calls per exec. Split the work.` }
+      }
+      if (name === 'Agent') {
+        repairs.push(...sent.repairs)
+        try {
+          return await callAgent(entry, sent.input)
+        } finally {
+          if (!isClosed) void publish()
+        }
       }
       await acquire()
       try {
@@ -1000,6 +1174,7 @@ export const register: Register = on => {
     let exit: { code: number | null; signal: string | null } | undefined
     let stderr = ''
     let protocolNote = ''
+    let stopNote = ''
     const inflight: Promise<void>[] = []
     const handle = (line: string) => {
       if (!line.startsWith(MARK)) return
@@ -1058,6 +1233,26 @@ export const register: Register = on => {
       }
     } finally {
       isClosed = true
+      // An agent the run left running answers no program, so TaskStop ends it.
+      const left = [...spawned]
+      for (const id of left) waiting.delete(id)
+      const stops = await Promise.all(
+        left.map(async id => {
+          try {
+            const r = await $.tool.call({ tool: 'TaskStop', task_id: id } as never)
+            if (r.deny !== undefined) return `${id}: ${r.deny}`
+            return r.isError === true ? `${id}: ${oneLine(r.text ?? '', 120)}` : undefined
+          } catch (err) {
+            return `${id}: ${err instanceof Error ? err.message : String(err)}`
+          }
+        }),
+      )
+      const unstopped = stops.filter(s => s !== undefined)
+      if (left.length) {
+        stopNote = unstopped.length
+          ? `TaskStop could not stop ${unstopped.length} of ${left.length} agents the run left running: ${unstopped.join('; ')}`
+          : `Stopped ${left.length} agent${left.length === 1 ? '' : 's'} the run left running.`
+      }
       $.ui.status(undefined)
       await $.process.run(['rm', '-rf', runDir])
     }
@@ -1082,7 +1277,7 @@ export const register: Register = on => {
     if (done?.note) head += `\n${done.note}`
 
     const logs = done?.logs?.length ? `console:\n${done.logs.join('\n')}` : ''
-    const footer = [ledgerLine(ledger), isFailed ? progressNote(ledger) : '', droppedNote(ledger), protocolNote]
+    const footer = [ledgerLine(ledger), isFailed ? progressNote(ledger) : '', droppedNote(ledger), stopNote, protocolNote]
       .filter(Boolean)
       .join('\n')
     const full = [head, logs, footer].filter(Boolean).join('\n\n')

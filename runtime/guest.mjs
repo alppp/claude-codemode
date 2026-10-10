@@ -202,6 +202,15 @@ function runProgram({ source, preludes, projectDir }) {
           : undefined,
     },
   )
+  // A subagent's final answer. The host spawns it and waits for its last
+  // turn. The wait counts as a tool wait, so it uses no program time.
+  const agent = async (prompt, opts = {}) => {
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      throw new GuestTypeError('agent(prompt, { type, model, ... }?) takes a prompt string first.')
+    }
+    const { type = 'general-purpose', model, description, name, cwd } = opts ?? {}
+    return (await ok('Agent', { prompt, subagent_type: type, model, description, name, cwd })).text
+  }
   // A file too big for one Read is read in pages. Each page asks for about
   // PAGE_CHARS, and a page over Read's token cap is retried smaller, quietly.
   // The whole read stops near READ_CAP chars with a note line.
@@ -379,7 +388,7 @@ function runProgram({ source, preludes, projectDir }) {
 
   let isLastHit = false
   Object.assign(context, {
-    tools, call, read, bash, sh, ssh, q, listTools, describe, store, helpers, projectDir,
+    tools, call, agent, read, bash, sh, ssh, q, listTools, describe, store, helpers, projectDir,
     console: guestConsole, ToolError,
     setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask, structuredClone,
     URL, URLSearchParams, TextEncoder, TextDecoder, atob, btoa,
@@ -509,7 +518,7 @@ function spliceLast(body) {
 // Errors.
 
 const GLOBALS =
-  'In scope: tools, call, read, bash, sh, ssh, q, listTools, describe, store, helpers, projectDir, console, ToolError, setTimeout, the prelude helpers, and the standard JavaScript built-ins.'
+  'In scope: tools, call, agent, read, bash, sh, ssh, q, listTools, describe, store, helpers, projectDir, console, ToolError, setTimeout, the prelude helpers, and the standard JavaScript built-ins.'
 const NODE_HINT = 'There are no Node APIs here. Do I/O through tools: read(), sh(), ssh(), tools.Name().'
 const NODE_NAMES = /^(require|process|Buffer|fetch|module|exports|__dirname|__filename|global)\b/
 

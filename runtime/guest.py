@@ -307,6 +307,15 @@ class Tools:
 tools = Tools()
 
 
+# A subagent's final answer. The host spawns it and waits for its last turn.
+# The wait counts as a tool wait, so it uses no program time.
+async def agent(prompt, type='general-purpose', model=None, description=None, name=None, cwd=None):
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise TypeError('agent(prompt, type=..., model=...) takes a prompt string first.')
+    args = {'prompt': prompt, 'subagent_type': type, 'model': model, 'description': description, 'name': name, 'cwd': cwd}
+    return (await ok('Agent', {k: v for k, v in args.items() if v is not None})).get('text')
+
+
 def file_of(r):
     result = r.get('result')
     f = result.get('file') if isinstance(result, dict) else None
@@ -559,7 +568,7 @@ def prepare(source):
 # Errors.
 
 GLOBALS = (
-    'In scope: tools, call, read, bash, sh, ssh, q, list_tools, describe, store, helpers, project_dir, '
+    'In scope: tools, call, agent, read, bash, sh, ssh, q, list_tools, describe, store, helpers, project_dir, '
     'print, ToolError, asyncio, json, re, the prelude helpers, and the Python built-ins.'
 )
 JS_SYNTAX = re.compile(r'\b(?:const|let|var)\s+[A-Za-z_$]|=>|===|!==|\bPromise\.|\bJSON\.|\bconsole\.log\b')
@@ -762,7 +771,7 @@ async def run(env, run_dir, soft_s):
     sys.modules['__codemode__'] = module
     scope = module.__dict__
     scope.update({
-        'tools': tools, 'call': call, 'read': read, 'bash': bash, 'sh': sh, 'ssh': ssh, 'q': q,
+        'tools': tools, 'call': call, 'agent': agent, 'read': read, 'bash': bash, 'sh': sh, 'ssh': ssh, 'q': q,
         'list_tools': list_tools, 'describe': describe, 'store': store, 'helpers': helpers,
         'project_dir': env['projectDir'], 'ToolError': ToolError,
         'asyncio': asyncio, 'json': json, 're': re, LAST: last,
