@@ -1,0 +1,4 @@
+# Local task list.
+TASKS.md
+# Mod type files that Claude Code provides. tsconfig.json extends them.
+.claude-plugin/types/

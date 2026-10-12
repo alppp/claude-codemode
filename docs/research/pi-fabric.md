@@ -8,7 +8,7 @@ Date: 2026-10-01. Read-only study. No mod files were changed.
 - Paths below are relative to `sources/pi-fabric-upstream` unless they start with `/`.
 - Session evidence: 714 pi session files in `~/.pi/agent/sessions/`. They hold 31,586 `fabric_exec` calls in 498 sessions. Most calls came from DeepSeek v4 flash, Grok 4.6, Kimi K3 and GLM 5.3. No Claude model is in this data.
 - Mod API: `/tmp/claude-1000/bundled-skills/2.1.286/4cbe4a17c5e2d4bb9361375664f7a462/plugin-authoring/types/claude-code.d.ts` (written below as `cc.d.ts`).
-- Mod source: `<plugin dir>/codemode/` (`hooks/register.ts`, `runtime/guest.mjs`). `~/.claude/mods/codemode` does not exist.
+- Mod source: this repo at v0.1 (`hooks/register.ts`, `runtime/guest.mjs`).
 
 ## Session numbers (pi-fabric, all models)
 

@@ -1,6 +1,6 @@
 # codemode: what other code-mode designs teach
 
-Date: 2026-10-01. Mod examined: `<plugin dir>/codemode/` (`hooks/register.ts`, `runtime/guest.mjs`). `~/.claude/mods/codemode/` does not exist.
+Date: 2026-10-01. Mod examined: this repo at v0.1 (`hooks/register.ts`, `runtime/guest.mjs`).
 
 Repos cloned for source reading:
 - `sources/agents` (Cloudflare Agents, `packages/codemode`, commit e780214, 2026-10-01)

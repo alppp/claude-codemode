@@ -32,6 +32,9 @@ READ_HEADS = {
     'date', 'echo', 'printf', 'test', 'env', 'readlink', 'realpath', 'basename', 'dirname', 'sort', 'uniq',
 }
 READ_GIT = {'log', 'show', 'status', 'diff', 'blame', 'grep', 'ls-files', 'rev-parse', 'branch', 'remote'}
+# Interpreter commands that count as probes: inline code, plus your own
+# read-only helper scripts if you add their names here.
+READ_SCRIPTS = re.compile(r'-c\s')
 # A shell write anywhere in the command makes it a write.
 WRITES = re.compile(r'(^|[^>&0-9])>(?!&|/dev/null)|\btee\b|\bsed\s+-i|\bmv\b|\bcp\b|\brm\b|\bmkdir\b|\bchmod\b|\bgit\s+(commit|push|add|checkout|reset|stash|pull)')
 LEAD = re.compile(r'^\s*(?:cd\s+\S+\s*(?:&&|;)\s*|[A-Z_][A-Z0-9_]*=\S*\s+|timeout\s+(?:-\S+\s+\S+\s+)?\S+\s+|sudo\s+(?:-A\s+)?)*')
@@ -52,8 +55,7 @@ def is_probe(name, inp):
     if head == 'git':
         return len(words) > 1 and words[1] in READ_GIT
     if head in ('node', 'python3', 'python'):
-        # Known read-only helper scripts only.
-        return bool(re.search(r'-c\s', cmd))
+        return bool(READ_SCRIPTS.search(cmd))
     return head in READ_HEADS
 
 
@@ -144,7 +146,7 @@ def main():
         s = session_stats(f, a.examples)
         if not s['ts'] or s['exec'] + s['probe'] == 0:
             continue
-        project = f.split('/projects/')[1].split('/')[0].replace('-home-user-', '').replace('GitHub-', '')
+        project = re.sub(r'^-home-[^-]+-', '', f.split('/projects/')[1].split('/')[0])
         rows.append((s['ts'], project, os.path.basename(f)[:8], s))
     rows.sort(key=lambda r: r[0])
     if not rows:
